@@ -18,6 +18,8 @@ This is a first hardware-test build. Compilation does not establish that the dis
 
 Start typing from the conversation to write. Enter or a short wheel click sends the message. Backspace erases. For numbers and symbols, press **Sym** and then the key: the top row types 1–0, and the other keys type the symbol printed on them (for example Sym, V types `?`). Press **Shift** and then a letter for a capital. Pressing Sym or Shift again cancels it; the status bar shows which is active. Sym, Backspace or holding the wheel for about 0.65 seconds leaves the editor and keeps your draft. Turn the wheel to read older/newer messages.
 
+Hold the wheel for 3 seconds to power off, then release it. On battery the Pager switches off completely; hold the PWR button to turn it on. While USB is connected the battery cannot power the board off, so the Pager sleeps with its radio, speaker, and keyboard switched off; press the wheel or BOOT button to turn it on. The Pager receives no messages while off or asleep.
+
 ### Wio L1 OLED
 
 Press the joystick to write. Move it in four directions to choose a key; press to enter it. The final four keys are `_` (space), `<` (erase), `^` (uppercase/lowercase), and `>` (save name or send). The footer describes the selected key. In the message editor the user button leaves the editor and keeps your draft; while entering your name it erases a character.

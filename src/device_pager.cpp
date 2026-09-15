@@ -4,6 +4,7 @@
 #include <Adafruit_GFX.h>
 #include <LittleFS.h>
 #include <esp_random.h>
+#include <esp_sleep.h>
 #include <math.h>
 #include <new>
 #include "device.h"
@@ -71,6 +72,38 @@ bool deviceBegin() {
     return canvas && canvas->getBuffer() && (found & HW_KEYBOARD_ONLINE);
 }
 void deviceTick() { instance.loop(); }
+// Holding the wheel this long powers the Pager off.
+static constexpr uint32_t PowerOffHoldMs=3000;
+[[noreturn]] static void powerOff() {
+    Serial.println("[pager] powering off");
+    instance.wakeupDisplay(); instance.setBrightness(10);
+    if(canvas && canvas->getBuffer()) {
+        canvas->fillScreen(0x0841); canvas->setTextWrap(false);
+        canvas->setTextSize(3); canvas->setTextColor(0x07ff);
+        canvas->setCursor(12,50); canvas->print("Powering off");
+        canvas->setTextSize(2); canvas->setTextColor(0xffff);
+        canvas->setCursor(12,110); canvas->print("To turn on: hold PWR.");
+        canvas->setCursor(12,140); canvas->print("On USB: press the wheel.");
+        canvas->byteSwap(); instance.pushColors(0,0,480,222,canvas->getBuffer());
+    }
+    // Wait for release: a button still held would wake deep sleep at once.
+    while(digitalRead(ROTARY_C)==LOW) delay(10);
+    delay(1000);
+    instance.setBrightness(0); instance.kb.setBrightness(0); instance.sleepDisplay();
+    Serial.flush();
+    // On battery, disconnecting the battery path turns the Pager off and the PWR button
+    // turns it on; ppm.resetDefault() in instance.begin() reconnects it at boot.
+    instance.ppm.shutdown();
+    delay(1000);
+    // Still running, so USB powers the board: sleep until the wheel or BOOT button,
+    // which restarts the firmware.
+    instance.powerControl(POWER_RADIO,false);
+    instance.powerControl(POWER_SPEAK,false);
+    instance.powerControl(POWER_HAPTIC_DRIVER,false);
+    instance.powerControl(POWER_KEYBOARD,false);
+    esp_sleep_enable_ext1_wakeup_io((1ULL<<ROTARY_C)|(1ULL<<0),ESP_EXT1_WAKEUP_ANY_LOW);
+    esp_deep_sleep_start();
+}
 Input deviceInput() {
     keyEvent={};
     instance.kb.getKey(nullptr); // delivers at most one event to onRawKey
@@ -79,6 +112,7 @@ Input deviceInput() {
     if(rotary.centerBtnPressed && !center) { pressedAt=millis(); held=false; }
     bool click=!rotary.centerBtnPressed && center && !held;
     center=rotary.centerBtnPressed;
+    if(center && millis()-pressedAt>=PowerOffHoldMs) powerOff();
     if(center && !held && millis()-pressedAt>=650) { held=true; return {Key::Quick,0}; }
     if(click) return {Key::Select,0};
     // Reversed so the wheel scrolls through messages in the expected direction.
@@ -97,19 +131,29 @@ void deviceChime() {
     if(!(found & HW_CODEC_ONLINE)) return;
     constexpr uint32_t rate=44100;
     struct Note { float hz; uint32_t ms; };
-    static constexpr Note notes[]={{1760,70},{2637,150}};
-    instance.codec.setVolume(70);
+    // C7 then E7: the Pager's small speaker is most efficient around 2-3 kHz.
+    static constexpr Note notes[]={{2093,90},{2637,260}};
     if(instance.codec.open(16,1,rate)<0) return;
+    // The ES8311 ignores volume changes while closed, so set it after open().
+    // 100 is the top of the codec's volume curve (0 dB).
+    instance.codec.setVolume(100);
     int16_t chunk[256];
     const size_t capacity=sizeof(chunk)/sizeof(chunk[0]);
+    // About 40 ms of silence first: open() has only just enabled the amplifier.
+    memset(chunk,0,sizeof(chunk));
+    for(int i=0;i<7;++i) instance.codec.write(reinterpret_cast<uint8_t*>(chunk),sizeof(chunk));
+    constexpr float drive=1.8f;
+    const float normalize=tanh(drive);
     for(const Note& note:notes) {
         const uint32_t total=rate*note.ms/1000;
         for(uint32_t i=0;i<total;) {
             size_t n=0;
             for(;n<capacity && i<total;++n,++i) {
-                // 5 ms attack and exponential decay: a soft "bling" without clicks.
-                const float t=float(i)/rate, attack=t<0.005f ? t/0.005f : 1.0f;
-                chunk[n]=int16_t(9000*attack*exp(-t*25)*sin(2*PI*note.hz*t));
+                // Full scale with a 3 ms attack and slow decay; gentle tanh saturation
+                // raises perceived loudness without the buzz of hard clipping.
+                const float t=float(i)/rate, attack=t<0.003f ? t/0.003f : 1.0f;
+                const float x=attack*exp(-t*6)*sin(2*PI*note.hz*t);
+                chunk[n]=int16_t(32000*tanh(drive*x)/normalize);
             }
             instance.codec.write(reinterpret_cast<uint8_t*>(chunk),n*sizeof(int16_t));
         }

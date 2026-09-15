@@ -34,12 +34,14 @@ Implemented from source without building or running tests:
 
 - Row 0 is a status bar (activity or view name, Pager modifier, battery %). "EVERYONE"/"TO EVERYONE" headings were removed.
 - `LMA1` acknowledgements and the delivered / not-delivered flow; the per-transmission pause was replaced by a 5% airtime credit budget (see architecture).
-- Chime: Wio uses `tone()` on the buzzer (P1.00); Pager opens the ES8311 codec (`NO_HW_CODEC` removed from `instance.begin`), writes a 220 ms tone, and closes it so the amplifier turns off. The Pager chime blocks the loop for about 250 ms.
+- Chime: Wio uses `tone()` on the buzzer (P1.00); Pager opens the ES8311 codec (`NO_HW_CODEC` removed from `instance.begin`), sets volume 100 after `open()` (the ES8311 driver ignores volume changes while closed, so the original `setVolume(70)` before `open()` had no effect), writes 40 ms of silence for amplifier start-up and a 350 ms full-scale, softly saturated two-note tone, and closes the codec so the amplifier turns off. The Pager chime blocks the loop for about 450 ms.
 - Battery: Pager reads the BQ27220 state of charge; Wio samples P0.31 with the divider enabled on P0.04, 3.6 V reference, ×2, mapped through a LiPo voltage curve. Accuracy of the Wio curve is unverified.
 - Display off after 10 s idle: Wio sends OLED display-off; Pager turns the backlight and keyboard backlight off and puts the ST7796 to sleep. The waking press is discarded. The Wio LED now turns off when `loop()` starts instead of blinking.
 - Pager keyboard: raw TCA8418 events are decoded with the physical Sym (key 20) and Shift (key 28) keys, which LilyGoLib's configuration mapped to Alt and Caps. Layout follows Meshtastic's `TLoraPagerKeyboard`.
 
 Regression found on the Pager: every message failed with "Channel busy; retry". The restructured loop read `now` before handling input, and `submit()` stamped `queuedAt=millis()` afterwards; on the Pager the I2C keyboard read advances the clock, so `now-queuedAt` wrapped to about 4 billion and the queue expired in the same pass. The loop now reads the clock after input, the expiry is a wrap-safe deadline, and the test fake advances time during input polling to catch this. The CAD send-anyway limit added while investigating remains.
+
+Pager power off: holding the wheel for 3 s shows "Powering off", waits for release, turns off the backlights and display, and sets the BQ25896 BATFET_DIS bit (`ppm.shutdown()`, as LilyGo's factory firmware does). On battery this removes power; the PWR button restarts the device, and `ppm.resetDefault()` during `instance.begin()` re-enables the battery path. With USB connected the board stays powered, so after 1 s the firmware switches off the radio, amplifier, haptic driver and keyboard through the XL9555 and enters ESP32 deep sleep with ext1 wake on the wheel button (GPIO7) or BOOT (GPIO0). Untested on hardware: both paths, the deep-sleep current, and that unplugging USB during that sleep leaves the device off.
 
 Hardware checks still needed: acknowledgement timing between the two boards, chime audibility, battery readings against a meter, display wake latency, and every Pager symbol.
 
