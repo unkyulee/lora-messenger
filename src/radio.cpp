@@ -50,7 +50,20 @@ int radioReceive(uint8_t* p,size_t cap) {
 }
 bool radioBusy() {
     if(transmitting || interrupt) return true;
-    int result=radio.scanChannel();
+    // RadioLib's synchronous CAD waits indefinitely for its IRQ. Bound this
+    // wait so a missing interrupt cannot trap the user on the sending screen.
+    int result=radio.startChannelScan();
+    const uint32_t scanStart=millis();
+#ifdef DEVICE_PAGER
+    constexpr int irqPin=LORA_IRQ;
+#else
+    constexpr int irqPin=1;
+#endif
+    if(result==RADIOLIB_ERR_NONE) {
+        while(!digitalRead(irqPin) && millis()-scanStart<250) delay(1);
+        result=digitalRead(irqPin) ? radio.getChannelScanResult() : RADIOLIB_ERR_RX_TIMEOUT;
+    }
+    radio.standby(); interrupt=false;
     radio.startReceive();
     return result!=RADIOLIB_CHANNEL_FREE;
 }

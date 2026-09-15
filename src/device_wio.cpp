@@ -35,6 +35,7 @@ Input deviceInput() {
 }
 int deviceColumns() { return 21; }
 void deviceDraw(const Screen& s) {
+    if(!display.getBuffer()) return;
     display.clearDisplay(); display.setTextSize(1); display.setTextWrap(false);
     for(int row=0;row<8;++row) {
         if(s.highlight==row) display.fillRect(0,row*8,128,8,SSD1306_WHITE);

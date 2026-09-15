@@ -4,7 +4,12 @@
 #include <Adafruit_GFX.h>
 #include <LittleFS.h>
 #include <esp_random.h>
+#include <new>
 #include "device.h"
+
+#if !defined(CONFIG_SPIRAM_MODE_QUAD) || !CONFIG_SPIRAM_MODE_QUAD
+#error "T-LoRa Pager requires quad SPI PSRAM: use qio_qspi in platformio.ini"
+#endif
 
 static GFXcanvas16* canvas=nullptr;
 static bool center=false;
@@ -12,11 +17,22 @@ static bool held=false;
 static uint32_t pressedAt=0;
 bool deviceBegin() {
     Serial.begin(115200);
+    // LilyGo's display initialization allocates a full framebuffer. Do not
+    // enter it without external RAM: allocation failure otherwise aborts.
+    if(!psramFound()) {
+        Serial.println("Pager startup stopped: quad SPI PSRAM did not initialize.");
+        return false;
+    }
     uint32_t found=instance.begin(NO_HW_GPS|NO_HW_NFC|NO_HW_SD|NO_HW_MIC|
         NO_HW_CODEC|NO_HW_SENSOR|NO_HW_RTC|NO_HW_LORA|NO_INIT_FATFS|NO_INIT_DELAY);
-    instance.setRotation(1); instance.setBrightness(10);
+    // LilyGo's rotation 0 is landscape (480x222); rotation 1 is portrait.
+    instance.setRotation(0); instance.setBrightness(10);
+    instance.powerControl(POWER_GPS,false);
+    instance.powerControl(POWER_NFC,false);
+    instance.powerControl(POWER_SD_CARD,false);
+    instance.powerControl(POWER_SPEAK,false);
     instance.kb.setRepeat(false);
-    canvas=new GFXcanvas16(480,222);
+    canvas=new (std::nothrow) GFXcanvas16(480,222);
     return canvas && canvas->getBuffer() && (found & HW_KEYBOARD_ONLINE);
 }
 void deviceTick() { instance.loop(); }

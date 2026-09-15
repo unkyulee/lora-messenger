@@ -181,6 +181,10 @@ void draw() {
 
 void setup() {
     displayOK=deviceBegin();
+    if(!displayOK) {
+        Serial.println("Startup stopped: display/input initialization failed.");
+        while(true) delay(250);
+    }
     storageOK=storageBegin();
     static chat::State candidate;
     if(storageOK) for(int slot=0;slot<2;++slot) {
@@ -219,7 +223,10 @@ void loop() {
             bool wasFull=state.count==chat::HistoryMax;
             if(state.add(incoming)) {
                 if(view==View::Inbox && atEnd) { selected=state.count-1; page=0; }
-                else { ++unread; if(wasFull && selected) --selected; }
+                else {
+                    ++unread;
+                    if(wasFull) { if(selected) --selected; else page=0; }
+                }
                 if(!persist()) notify("History not saved");
                 dirty=true;
             }
