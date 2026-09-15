@@ -26,7 +26,22 @@ The user reported a Wio Tracker L1 Pro with no serial output. Seeed lists the sa
 
 The diagnostics identified the cause: the L1 Pro's I2C scan found only `0x3D`, and the probe of `0x3C` failed. The firmware previously hard-coded `0x3C`, so every display write went unacknowledged. `deviceBegin` now probes `0x3C` then `0x3D` and uses the one that answers. Not yet confirmed on hardware.
 
-With the address fixed, only the top text row updated and the previous Meshtastic screen remained below it. That is an SH1106 driven by the SSD1306 driver: the SH1106 ignores SSD1306 column/page window commands, so every frame lands in page 0. Meshtastic identifies the controller at runtime from the status register's low nibble (0x08/0x00 = SH1106), overriding the board's `USE_SSD1306`. The Wio adapter now applies the same probe, then uses `Adafruit_SH1106G` (Adafruit SH110X 2.1.15) or `Adafruit_SSD1306`, and logs the result. Not yet confirmed on hardware.
+With the address fixed, only the top text row updated and the previous Meshtastic screen remained below it. That is an SH1106 driven by the SSD1306 driver: the SH1106 ignores SSD1306 column/page window commands, so every frame lands in page 0. Meshtastic identifies the controller at runtime from the status register's low nibble (0x08/0x00 = SH1106), overriding the board's `USE_SSD1306`. The Wio adapter first applied the same probe, but on the L1 Pro the status register read 0x00 and then 0x16. Meshtastic stops after the first matching read and chooses SH1106; a loop that kept reading chose SSD1306, and only the bottom row updated. The status register therefore cannot identify this panel. The Wio adapter now always uses `Adafruit_SH1106G` (Adafruit SH110X 2.1.15), and the Adafruit SSD1306 dependency was removed. Not yet confirmed on hardware.
+
+## Status bar, acknowledgements, chime, battery, display sleep, Pager symbols
+
+Implemented from source without building or running tests:
+
+- Row 0 is a status bar (activity or view name, Pager modifier, battery %). "EVERYONE"/"TO EVERYONE" headings were removed.
+- `LMA1` acknowledgements and the delivered / not-delivered flow; the per-transmission pause was replaced by a 5% airtime credit budget (see architecture).
+- Chime: Wio uses `tone()` on the buzzer (P1.00); Pager opens the ES8311 codec (`NO_HW_CODEC` removed from `instance.begin`), writes a 220 ms tone, and closes it so the amplifier turns off. The Pager chime blocks the loop for about 250 ms.
+- Battery: Pager reads the BQ27220 state of charge; Wio samples P0.31 with the divider enabled on P0.04, 3.6 V reference, ×2, mapped through a LiPo voltage curve. Accuracy of the Wio curve is unverified.
+- Display off after 10 s idle: Wio sends OLED display-off; Pager turns the backlight and keyboard backlight off and puts the ST7796 to sleep. The waking press is discarded. The Wio LED now turns off when `loop()` starts instead of blinking.
+- Pager keyboard: raw TCA8418 events are decoded with the physical Sym (key 20) and Shift (key 28) keys, which LilyGoLib's configuration mapped to Alt and Caps. Layout follows Meshtastic's `TLoraPagerKeyboard`.
+
+Regression found on the Pager: every message failed with "Channel busy; retry". The restructured loop read `now` before handling input, and `submit()` stamped `queuedAt=millis()` afterwards; on the Pager the I2C keyboard read advances the clock, so `now-queuedAt` wrapped to about 4 billion and the queue expired in the same pass. The loop now reads the clock after input, the expiry is a wrap-safe deadline, and the test fake advances time during input polling to catch this. The CAD send-anyway limit added while investigating remains.
+
+Hardware checks still needed: acknowledgement timing between the two boards, chime audibility, battery readings against a meter, display wake latency, and every Pager symbol.
 
 ## Automated checks
 

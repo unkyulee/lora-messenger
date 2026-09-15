@@ -4,24 +4,45 @@
 #include "device.h"
 
 namespace {
+constexpr uint32_t NoticeMs=4000, ScreenTimeoutMs=10000, BatteryPeriodMs=30000;
+// After its transmission completes, a sender listens this long for any receiver's acknowledgement.
+constexpr uint32_t AckWindowMs=3000;
+// Channel activity detection is a courtesy; the airtime budget bounds transmissions.
+// After this many busy results, send anyway so a noisy receiver front end cannot block sending.
+constexpr unsigned MaxBusyChecks=5, MaxAckBusyChecks=2;
 chat::State state;
 chat::Message pending;
-uint8_t snapshot[chat::SnapshotMax], packet[chat::PacketMax];
-enum class View { Name, Inbox, Compose, Replies };
+uint8_t snapshot[chat::SnapshotMax], packet[chat::PacketMax], outgoing[chat::PacketMax];
+size_t outgoingLength=0;
+enum class View { Name, Inbox, Compose };
+enum class Tx { None, Message, Ack };
 View view=View::Name;
-char draft[chat::TextMax+1]={}, notice[41]={};
-size_t selected=0, page=0, reply=0, keyboard=0;
-uint32_t session=0, sequence=0, noticeUntil=0, retryAt=0, queuedAt=0;
-int activeSlot=-1;
-bool storageOK=false, radioOK=false, displayOK=false, dirty=true;
-bool queued=false, sending=false, upper=false;
+Tx tx=Tx::None;
+char draft[chat::TextMax+1]={}, notice[41]={}, status[24]={};
+size_t selected=0, page=0, keyboard=0;
+uint32_t session=0, sequence=0, noticeUntil=0, statusUntil=0, retryAt=0, queueExpires=0;
+uint32_t ackDeadline=0, lastInput=0, batteryAt=0;
+int activeSlot=-1, battery=-1;
+unsigned busyChecks=0;
+bool storageOK=false, radioOK=false, displayOK=false, dirty=true, displayOn=true;
+// retryable: `pending` is undelivered, so resending unchanged text reuses its identity.
+bool queued=false, sending=false, awaiting=false, retryable=false, upper=false;
+const char* modifier="";
 unsigned unread=0;
 chat::AirtimeGate gate;
-const char* replies[]={"Ciao!", "OK", "Sto arrivando", "Dove sei?", "Ci sono", "A dopo!"};
+struct PendingAck { chat::Ack ack; uint32_t due=0, expires=0; unsigned busyChecks=0; bool used=false; };
+PendingAck acks[4];
 constexpr char keymap[]="abcdefghijklmnopqrstuvwxyz0123456789_<^>";
 
 void notify(const char* text) {
-    snprintf(notice,sizeof(notice),"%s",text); noticeUntil=millis()+4000; dirty=true;
+    snprintf(notice,sizeof(notice),"%s",text); noticeUntil=millis()+NoticeMs; dirty=true;
+}
+void setStatus(const char* text) {
+    snprintf(status,sizeof(status),"%s",text); statusUntil=millis()+NoticeMs; dirty=true;
+}
+void wake() {
+    lastInput=millis();
+    if(!displayOn) { displayOn=true; deviceDisplay(true); dirty=true; }
 }
 bool persist() {
     if(!storageOK) return false;
@@ -41,7 +62,7 @@ void append(char c) {
     else notify(view==View::Name ? "Name: 16 characters" : "Message is full");
 }
 void submit() {
-    if(queued || sending) return;
+    if(queued || sending || awaiting) return;
     chat::trim(draft);
     if(!draft[0]) { notify(view==View::Name ? "Enter your name" : "Write a message first"); return; }
     if(view==View::Name) {
@@ -50,16 +71,66 @@ void submit() {
         draft[0]=0; view=View::Inbox; dirty=true; return;
     }
     if(!radioOK) { notify("Radio unavailable"); return; }
-    pending=chat::Message{}; pending.sender=deviceId(); pending.session=session;
-    pending.sequence=++sequence;
-    if(!sequence) { session=deviceRandom()|1u; pending.session=session; pending.sequence=++sequence; }
-    memcpy(pending.name,state.name,sizeof(state.name));
-    memcpy(pending.text,draft,strlen(draft)+1);
-    queued=true; queuedAt=millis(); retryAt=millis()+100+(deviceRandom()%500); dirty=true;
+    // Unchanged text keeps its identity, so a receiver whose acknowledgement
+    // was lost does not store the resent message twice.
+    if(!retryable || strcmp(pending.text,draft)) {
+        pending=chat::Message{}; pending.sender=deviceId(); pending.session=session;
+        pending.sequence=++sequence;
+        if(!sequence) { session=deviceRandom()|1u; pending.session=session; pending.sequence=++sequence; }
+        memcpy(pending.name,state.name,sizeof(state.name));
+        memcpy(pending.text,draft,strlen(draft)+1);
+    }
+    outgoingLength=chat::encode(pending,outgoing,sizeof(outgoing));
+    if(!outgoingLength) { notify("Message cannot be sent"); return; }
+    gate.update(millis());
+    Serial.printf("[send] queued %u bytes, airtime %u ms, credit %u ms\n",unsigned(outgoingLength),
+        unsigned(radioAirtime(outgoingLength)),unsigned(gate.credit/20));
+    retryable=true; busyChecks=0;
+    queued=true; queueExpires=millis()+90000; retryAt=millis()+100+(deviceRandom()%500); dirty=true;
+}
+void sendFailed(const char* why) {
+    // Back to the editor with the text kept, ready to change or resend.
+    view=View::Compose; keyboard=39; notify(why); setStatus("Not delivered"); wake();
+}
+void delivered() {
+    awaiting=false; retryable=false;
+    state.add(pending); selected=state.count-1; page=0; unread=0;
+    draft[0]=0; view=View::Inbox;
+    if(!persist()) notify("Sent; history unsaved");
+    setStatus("Delivered"); wake();
+}
+void scheduleAck(const chat::Message& m,uint32_t now) {
+    PendingAck* slot=nullptr;
+    for(auto& a:acks) {
+        if(a.used && a.ack.sender==m.sender && a.ack.session==m.session && a.ack.sequence==m.sequence) return;
+        if(!a.used && !slot) slot=&a;
+    }
+    if(!slot) return;
+    slot->ack=chat::Ack{}; slot->ack.sender=m.sender; slot->ack.session=m.session;
+    slot->ack.sequence=m.sequence; slot->ack.from=deviceId();
+    // A random delay spreads replies from several receivers; the sender needs only one.
+    slot->due=now+150+deviceRandom()%900;
+    slot->expires=now+AckWindowMs-radioAirtime(chat::AckSize)-200;
+    slot->busyChecks=0; slot->used=true;
+}
+void serviceAcks(uint32_t now) {
+    if(tx!=Tx::None) return;
+    const uint32_t air=radioAirtime(chat::AckSize);
+    for(auto& a:acks) {
+        if(!a.used || !chat::due(now,a.due)) continue;
+        if(chat::due(now,a.expires)) { a.used=false; continue; }
+        if(!gate.ready(now,air)) continue;
+        if(a.busyChecks<MaxAckBusyChecks && radioBusy()) { ++a.busyChecks; a.due=now+200+deviceRandom()%600; continue; }
+        a.used=false;
+        size_t n=chat::encodeAck(a.ack,packet,sizeof(packet));
+        gate.charge(now,air);
+        if(n && radioSend(packet,n)) tx=Tx::Ack;
+        return;
+    }
 }
 void input(Input in) {
-    if(in.key==Key::None) return;
-    if(queued || sending) {
+    if(in.key==Key::None || in.key==Key::Modifier) return;
+    if(queued || sending || awaiting) {
         if(queued && (in.key==Key::Back || in.key==Key::Quick)) { queued=false; notify("Send cancelled"); }
         return;
     }
@@ -68,12 +139,10 @@ void input(Input in) {
         if(in.key==Key::Up && selected>0) { --selected; page=0; }
         if(in.key==Key::Down && selected+1<state.count) { ++selected; page=0; }
         if(in.key==Key::Left && page) --page;
-        if(in.key==Key::Right) {
-            size_t pages=state.count ? (strlen(state.messages[selected].text)+deviceColumns()*4-1)/(deviceColumns()*4) : 1;
+        if(in.key==Key::Right && state.count) {
+            size_t pages=(strlen(state.messages[selected].text)+deviceColumns()*4-1)/(deviceColumns()*4);
             if(page+1<pages) ++page;
-            else { view=View::Replies; reply=0; }
         }
-        if(in.key==Key::Quick) { view=View::Replies; reply=0; }
         if(in.key==Key::Select || in.key==Key::Send || in.key==Key::Character) {
             view=View::Compose; keyboard=0;
             if(in.key==Key::Character) append(in.character);
@@ -81,19 +150,13 @@ void input(Input in) {
         if(state.count && selected==state.count-1) unread=0;
         return;
     }
-    if(view==View::Replies) {
-        if(in.key==Key::Up) reply=(reply+5)%6;
-        if(in.key==Key::Down) reply=(reply+1)%6;
-        if(in.key==Key::Back || in.key==Key::Left || in.key==Key::Quick) { view=View::Inbox; return; }
-        if(in.key==Key::Select || in.key==Key::Send) {
-            snprintf(draft,sizeof(draft),"%s",replies[reply]); view=View::Compose;
-            keyboard=39; // Send is selected; one further click confirms the reply.
-        }
-        return;
-    }
     if(in.key==Key::Character) { append(in.character); return; }
     if(in.key==Key::Send) { submit(); return; }
     if(in.key==Key::Back) {
+#ifndef DEVICE_PAGER
+        // Wio: the user button leaves the editor and keeps the draft; '<' erases.
+        if(view==View::Compose) { view=View::Inbox; return; }
+#endif
         size_t n=strlen(draft);
         if(n) draft[n-1]=0;
         else if(view==View::Compose) view=View::Inbox;
@@ -119,11 +182,24 @@ void input(Input in) {
 void line(Screen& s,int row,const char* value) {
     snprintf(s.lines[row],size_t(deviceColumns())+1,"%s",value);
 }
+// Row 0: activity or view name on the left, modifier and battery on the right.
+void statusBar(Screen& s,const char* label) {
+    const size_t cols=deviceColumns();
+    char right[16];
+    if(battery>=0) snprintf(right,sizeof(right),"%s%s%d%%",modifier,modifier[0] ? " " : "",battery);
+    else snprintf(right,sizeof(right),"%s",modifier);
+    size_t rl=strlen(right), ll=strlen(label);
+    if(rl>cols) rl=cols;
+    if(ll+rl+1>cols) ll=cols>rl+1 ? cols-rl-1 : 0;
+    memset(s.lines[0],' ',cols); s.lines[0][cols]=0;
+    memcpy(s.lines[0],label,ll);
+    memcpy(s.lines[0]+cols-rl,right,rl);
+}
 void draw() {
     Screen screen;
     const size_t cols=deviceColumns();
+    const char* label=view==View::Name ? "Your name?" : view==View::Inbox ? "Messages" : "Message";
     if(view==View::Inbox) {
-        line(screen,0,"EVERYONE");
         if(!state.count) {
             line(screen,2,"No messages yet"); line(screen,3,"Say hello nearby.");
         } else {
@@ -134,20 +210,18 @@ void draw() {
                 size_t n=len-offset<cols ? len-offset : cols;
                 memcpy(screen.lines[row],m.text+offset,n); offset+=n;
             }
-            snprintf(screen.lines[6],cols+1,"%u/%u  p%u/%u +%u",unsigned(selected+1),unsigned(state.count),
-                unsigned(page+1),unsigned((len+cols*4-1)/(cols*4)),unread);
+            int used=snprintf(screen.lines[6],cols+1,"%u/%u  p%u/%u",unsigned(selected+1),unsigned(state.count),
+                unsigned(page+1),unsigned((len+cols*4-1)/(cols*4)));
+            // The unread count only appears when messages arrived while reading older ones.
+            if(unread && used>=0 && size_t(used)<cols)
+                snprintf(screen.lines[6]+used,cols+1-used," +%u",unread);
         }
 #ifdef DEVICE_PAGER
-        line(screen,7,"Type:write Wheel:read Hold:replies");
+        line(screen,7,"Type:write Wheel:read");
 #else
         line(screen,7,"OK:write R:more");
 #endif
-    } else if(view==View::Replies) {
-        line(screen,0,"QUICK REPLIES");
-        for(int i=0;i<6;++i) line(screen,i+1,replies[i]);
-        screen.highlight=uint8_t(reply+1); line(screen,7,"OK:choose Back:close");
     } else {
-        line(screen,0,view==View::Name ? "WHAT'S YOUR NAME?" : "TO EVERYONE");
         size_t len=strlen(draft), start=len>cols*2-1 ? len-(cols*2-1) : 0;
         for(int row=1;row<3;++row) {
             size_t n=len-start<cols ? len-start : cols;
@@ -155,7 +229,7 @@ void draw() {
             if(start==len) { if(n<cols) screen.lines[row][n]='_'; break; }
         }
 #ifdef DEVICE_PAGER
-        line(screen,4,view==View::Name ? "Choose the name others will see." : "Everyone nearby can read this.");
+        if(view==View::Name) line(screen,4,"Choose the name others will see.");
         snprintf(screen.lines[6],cols+1,"%u/%u characters",unsigned(len),unsigned(view==View::Name ? chat::NameMax : chat::TextMax));
         line(screen,7,view==View::Name ? "Enter:save name" : "Enter:send  Hold wheel:back");
 #else
@@ -165,14 +239,20 @@ void draw() {
             if(col<9) screen.lines[row+3][col*2+1]=' ';
         }
         screen.caretRow=uint8_t(keyboard/10+3); screen.caretColumn=uint8_t((keyboard%10)*2);
-        const char* action=keyboard==36 ? "OK:space" : keyboard==37 ? "OK:erase" : keyboard==38 ? "OK:ABC/abc" : keyboard==39 ? (view==View::Name ? "OK:save name" : "OK:send to everyone") : "OK:letter Back:erase";
+        const char* action=keyboard==36 ? "OK:space" : keyboard==37 ? "OK:erase" : keyboard==38 ? "OK:ABC/abc" :
+            keyboard==39 ? (view==View::Name ? "OK:save name" : "OK:send to everyone") :
+            view==View::Name ? "OK:letter Back:erase" : "OK:letter Back:exit";
         line(screen,7,action);
 #endif
     }
-    if(queued || sending) {
-        line(screen,0,sending ? "SENDING..." : "WAITING TO SEND...");
-        line(screen,7,sending ? "" : "Back:cancel");
-    } else if(notice[0]) line(screen,7,notice);
+    if(queued) label="Waiting to send";
+    else if(sending) label="Sending...";
+    else if(awaiting) label="Waiting for ack";
+    else if(status[0]) label=status;
+    statusBar(screen,label);
+    if(queued) line(screen,7,"Back:cancel");
+    else if(sending || awaiting) line(screen,7,"");
+    else if(notice[0]) line(screen,7,notice);
     else if(!radioOK) line(screen,7,"Radio unavailable");
     else if(!storageOK) line(screen,7,"Storage unavailable");
     deviceDraw(screen); dirty=false;
@@ -201,28 +281,51 @@ void setup() {
     Serial.printf("[boot] starting radio\n");
     radioOK=radioBegin();
     Serial.printf("[boot] radio %s, drawing first screen\n",radioOK ? "ok" : "FAILED");
-    // Even repeated power cycles cannot bypass the inter-transmission pause.
-    gate.next=millis()+(radioOK ? radioAirtime(chat::PacketMax)*20+100 : 30000);
-    if(!displayOK) Serial.println("Display/input initialization failed");
+    // Airtime credit starts empty, so power cycling cannot bypass the budget.
+    gate.start(millis());
+    battery=deviceBattery(); batteryAt=millis()+BatteryPeriodMs; lastInput=millis();
     draw();
 }
 void loop() {
-    deviceTick(); input(deviceInput());
+    deviceTick();
+    Input in=deviceInput();
+    if(in.key!=Key::None) {
+        const bool asleep=!displayOn;
+        wake();
+        if(!asleep) input(in); // the press that wakes the display is not acted on
+    }
+    // Read the clock after input: submit() stamps its deadlines with millis(), and a
+    // `now` taken earlier (the Pager's I2C keyboard read takes milliseconds) would be
+    // behind them.
     const uint32_t now=millis();
     if(notice[0] && chat::due(now,noticeUntil)) { notice[0]=0; dirty=true; }
+    if(status[0] && chat::due(now,statusUntil)) { status[0]=0; dirty=true; }
+    if(chat::due(now,batteryAt)) {
+        batteryAt=now+BatteryPeriodMs;
+        const int level=deviceBattery();
+        if(level!=battery) { battery=level; dirty=true; }
+    }
+    const char* activeModifier=deviceModifier();
+    if(activeModifier!=modifier) { modifier=activeModifier; dirty=true; }
     if(radioOK) {
-        int result=radioResult();
-        if(sending && result) {
-            sending=false;
-            if(result>0) {
-                state.add(pending); selected=state.count-1; page=0; unread=0;
-                draft[0]=0; view=View::Inbox;
-                notify(persist() ? "Broadcast sent" : "Sent; history unsaved");
-            } else notify("Send failed; try again");
+        if(tx!=Tx::None) {
+            int result=radioResult();
+            if(result) {
+                if(tx==Tx::Message) {
+                    sending=false;
+                    Serial.printf("[send] transmission %s\n",result>0 ? "complete, waiting for ack" : "FAILED");
+                    if(result>0) { awaiting=true; ackDeadline=now+AckWindowMs; }
+                    else sendFailed("Send failed; try again");
+                }
+                tx=Tx::None; dirty=true;
+            }
         }
         int n=radioReceive(packet,sizeof(packet));
         chat::Message incoming;
+        chat::Ack ack;
         if(n>0 && chat::decode(packet,size_t(n),incoming) && incoming.sender!=deviceId()) {
+            // Acknowledge duplicates too: the sender may have missed the first acknowledgement.
+            scheduleAck(incoming,now);
             bool atEnd=!state.count || selected==state.count-1;
             bool wasFull=state.count==chat::HistoryMax;
             if(state.add(incoming)) {
@@ -232,21 +335,32 @@ void loop() {
                     if(wasFull) { if(selected) --selected; else page=0; }
                 }
                 if(!persist()) notify("History not saved");
-                dirty=true;
+                setStatus("New message"); wake(); deviceChime();
             }
+        } else if(n>0 && awaiting && chat::decodeAck(packet,size_t(n),ack) &&
+                  ack.from!=deviceId() && chat::acknowledges(ack,pending)) {
+            delivered();
         }
-        if(queued && now-queuedAt>90000) { queued=false; notify("Channel busy; retry"); }
-        if(queued && gate.ready(now) && chat::due(now,retryAt)) {
-            if(radioBusy()) retryAt=now+300+deviceRandom()%1200;
-            else {
-                size_t length=chat::encode(pending,packet,sizeof(packet));
-                gate.charge(now,radioAirtime(length)); queued=false;
-                sending=length && radioSend(packet,length);
-                if(!sending) notify("Send failed; try again");
-                dirty=true;
+        if(awaiting && chat::due(now,ackDeadline)) { awaiting=false; sendFailed("Nobody received it"); }
+        if(queued && chat::due(now,queueExpires)) { queued=false; notify("Channel busy; retry"); }
+        serviceAcks(now);
+        if(queued && tx==Tx::None && chat::due(now,retryAt)) {
+            const uint32_t air=radioAirtime(outgoingLength);
+            if(gate.ready(now,air)) {
+                if(busyChecks<MaxBusyChecks && radioBusy()) {
+                    ++busyChecks; retryAt=now+300+deviceRandom()%1200;
+                } else {
+                    if(busyChecks==MaxBusyChecks) Serial.printf("[send] channel busy %u times; sending anyway\n",busyChecks);
+                    gate.charge(now,air); queued=false;
+                    sending=radioSend(outgoing,outgoingLength);
+                    if(sending) tx=Tx::Message;
+                    else sendFailed("Send failed; try again");
+                    dirty=true;
+                }
             }
         }
     }
-    if(dirty) draw();
+    if(displayOn && chat::due(now,lastInput+ScreenTimeoutMs)) { displayOn=false; deviceDisplay(false); }
+    if(dirty && displayOn) draw();
     delay(5);
 }

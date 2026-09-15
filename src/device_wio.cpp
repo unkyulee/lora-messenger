@@ -2,39 +2,26 @@
 #include <Arduino.h>
 #include <Adafruit_TinyUSB.h>
 #include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
 #include <Adafruit_SH110X.h>
 #include <InternalFileSystem.h>
 #include "device.h"
 
-// Wio L1 variants differ: the L1 Pro has an SH1106 at 0x3D. Buffers are only
-// allocated by begin(), so keeping both drivers costs no framebuffer RAM.
-static Adafruit_SSD1306 ssd1306(128,64,&Wire,-1);
-static Adafruit_SH1106G sh1106(128,64,&Wire,-1);
-static Adafruit_GFX* display=nullptr;
-static bool useSH1106=false;
+// The Wio L1's 1.3" OLED is an SH1106. Its status register does not identify it
+// reliably (reads 0x00, then 0x16), and the SSD1306 driver cannot address its rows.
+static Adafruit_SH1106G display(128,64,&Wire,-1);
+static bool displayReady=false;
 static constexpr uint8_t pins[]={25,26,27,28,29,13};
 static constexpr Key keys[]={Key::Up,Key::Down,Key::Left,Key::Right,Key::Select,Key::Back};
+// Arduino pin numbers from the variant: buzzer P1.00, VBAT sense P0.31, divider enable P0.04.
+static constexpr uint8_t BuzzerPin=12, BatteryPin=16, BatteryEnablePin=30;
 static bool raw[6]={}, stable[6]={};
 static uint32_t changed[6]={}, repeated[6]={};
-static bool led=true;
-static void clearScreen() { if(useSH1106) sh1106.clearDisplay(); else ssd1306.clearDisplay(); }
-static void showScreen() { if(useSH1106) sh1106.display(); else ssd1306.display(); }
-// Meshtastic's heuristic: a status-register low nibble of 0x08 or 0x00 is an SH1106.
-static bool probeSH1106(uint8_t address) {
-    uint8_t r=0, previous=0;
-    int tries=0;
-    do {
-        previous=r;
-        Wire.beginTransmission(address); Wire.write(uint8_t(0x00)); Wire.endTransmission();
-        Wire.requestFrom(address,size_t(1));
-        if(Wire.available()) r=Wire.read()&0x0f;
-    } while(r!=previous && ++tries<4);
-    Serial.printf("[wio] OLED status nibble 0x%X\n",r);
-    return r==0x08 || r==0x00;
-}
+struct Note { uint16_t hz, ms; };
+static constexpr Note chime[]={{1760,70},{2637,150}};
+static int chimeStep=-1;
+static uint32_t chimeNext=0;
 bool deviceBegin() {
-    // LED: never lit = firmware not running; steady = stuck in setup; blinking = loop running.
+    // LED: never lit = firmware not running; steady = stuck in setup; off once loop() runs.
     pinMode(LED_BUILTIN,OUTPUT); digitalWrite(LED_BUILTIN,HIGH);
     Serial.begin(115200);
     // USB serial drops output until a monitor opens the port; wait up to 5 s for one.
@@ -48,7 +35,7 @@ bool deviceBegin() {
         if(Wire.endTransmission()==0) Serial.printf(" 0x%02X",a);
     }
     Serial.println();
-    // Probe the panel first: Adafruit_SSD1306::begin never checks for an ACK.
+    // The L1 Pro's OLED answers at 0x3D; 0x3C is the other common address.
     uint8_t address=0;
     static constexpr uint8_t addresses[]={0x3c,0x3d};
     for(uint8_t candidate:addresses) {
@@ -56,21 +43,25 @@ bool deviceBegin() {
         if(Wire.endTransmission()==0) { address=candidate; break; }
     }
     if(!address) { Serial.println("[wio] no OLED acknowledged at 0x3C or 0x3D"); return false; }
-    useSH1106=probeSH1106(address);
-    bool ok=useSH1106 ? sh1106.begin(address,true) : ssd1306.begin(SSD1306_SWITCHCAPVCC,address,true,false);
-    if(!ok) { Serial.println("[wio] OLED initialization failed"); return false; }
-    display=useSH1106 ? static_cast<Adafruit_GFX*>(&sh1106) : &ssd1306;
+    if(!display.begin(address,true)) { Serial.println("[wio] OLED initialization failed"); return false; }
+    displayReady=true;
     // Show a frame now: storage and radio setup run before the first draw().
-    clearScreen(); display->setTextColor(SSD1306_WHITE);
-    display->setCursor(0,0); display->print("Starting..."); showScreen();
-    Serial.printf("[wio] %s OLED ok at 0x%02X, showing Starting...\n",useSH1106 ? "SH1106" : "SSD1306",address);
+    display.clearDisplay(); display.setTextColor(SH110X_WHITE);
+    display.setCursor(0,0); display.print("Starting..."); display.display();
+    Serial.printf("[wio] SH1106 OLED ok at 0x%02X, showing Starting...\n",address);
     return true;
 }
 void deviceTick() {
-    // Output pins read back as 0 on this core, so track the LED state here.
-    static uint32_t toggled=0;
-    if(millis()-toggled>=500) { toggled=millis(); led=!led; digitalWrite(LED_BUILTIN,led); }
+    static bool ledOff=false;
+    if(!ledOff) { digitalWrite(LED_BUILTIN,LOW); ledOff=true; }
+    if(chimeStep>=0 && int32_t(millis()-chimeNext)>=0) {
+        if(chimeStep<int(sizeof(chime)/sizeof(chime[0]))) {
+            tone(BuzzerPin,chime[chimeStep].hz,chime[chimeStep].ms);
+            chimeNext=millis()+chime[chimeStep].ms+10; ++chimeStep;
+        } else { noTone(BuzzerPin); chimeStep=-1; }
+    }
 }
+void deviceChime() { chimeStep=0; chimeNext=millis(); }
 Input deviceInput() {
     const uint32_t now=millis();
     for(int i=0;i<6;++i) {
@@ -87,17 +78,37 @@ Input deviceInput() {
     return {};
 }
 int deviceColumns() { return 21; }
+const char* deviceModifier() { return ""; }
+int deviceBattery() {
+    // The divider is only enabled while sampling (Meshtastic: ADC_CTRL active high).
+    pinMode(BatteryEnablePin,OUTPUT); digitalWrite(BatteryEnablePin,HIGH); delay(10);
+    analogReference(AR_INTERNAL); analogReadResolution(12);
+    uint32_t sum=0;
+    for(int i=0;i<4;++i) sum+=analogRead(BatteryPin);
+    digitalWrite(BatteryEnablePin,LOW);
+    // 3.6 V reference, 12 bits, 1:2 divider.
+    const int mv=int(sum*3600u*2u/(4u*4095u));
+    // LiPo open-circuit voltage for 0%..100% in 10% steps (Meshtastic's default curve).
+    static constexpr int curve[]={3100,3300,3420,3530,3630,3720,3800,3890,3990,4050,4190};
+    if(mv<=curve[0]) return 0;
+    if(mv>=curve[10]) return 100;
+    int i=1;
+    while(mv>curve[i]) ++i;
+    return (i-1)*10+10*(mv-curve[i-1])/(curve[i]-curve[i-1]);
+}
+void deviceDisplay(bool on) {
+    if(displayReady) display.oled_command(on ? SH110X_DISPLAYON : SH110X_DISPLAYOFF);
+}
 void deviceDraw(const Screen& s) {
-    if(!display) return;
-    // SSD1306_* and SH110X_* colors share the values 0 (black), 1 (white), 2 (inverse).
-    clearScreen(); display->setTextSize(1); display->setTextWrap(false);
+    if(!displayReady) return;
+    display.clearDisplay(); display.setTextSize(1); display.setTextWrap(false);
     for(int row=0;row<8;++row) {
-        if(s.highlight==row) display->fillRect(0,row*8,128,8,SSD1306_WHITE);
-        display->setTextColor(s.highlight==row ? SSD1306_BLACK : SSD1306_WHITE);
-        display->setCursor(0,row*8); display->print(s.lines[row]);
+        if(s.highlight==row) display.fillRect(0,row*8,128,8,SH110X_WHITE);
+        display.setTextColor(s.highlight==row ? SH110X_BLACK : SH110X_WHITE);
+        display.setCursor(0,row*8); display.print(s.lines[row]);
     }
-    if(s.caretRow<8) display->fillRect(s.caretColumn*6,s.caretRow*8,6,8,SSD1306_INVERSE);
-    showScreen();
+    if(s.caretRow<8) display.fillRect(s.caretColumn*6,s.caretRow*8,6,8,SH110X_INVERSE);
+    display.display();
 }
 uint64_t deviceId() { return uint64_t(NRF_FICR->DEVICEID[0]) | uint64_t(NRF_FICR->DEVICEID[1])<<32; }
 uint32_t deviceRandom() {

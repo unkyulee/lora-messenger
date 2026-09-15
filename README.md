@@ -10,17 +10,19 @@ This is a first hardware-test build. Compilation does not establish that the dis
 - Subsequent startups open the conversation. The most recent 24 sent/received messages are saved in flash.
 - Messages can contain up to 160 printable ASCII characters. Italian accents are not supported yet; use `e'`, for example. The Wio keyboard currently offers letters, numbers, and spaces; the Pager also offers its physical symbol keys.
 - Every transmission is public to compatible devices within direct radio range. Both devices need this firmware; it does **not** exchange messages with Meshtastic, MeshCore, or LoRaWAN.
-- “Broadcast sent” means the radio completed transmission. It is not a delivery receipt.
+- After sending, the device waits up to 3 seconds for an acknowledgement from any device that received the message. The status bar then shows “Delivered”. If nobody acknowledges it, it shows “Not delivered” and reopens the editor with your text; sending the unchanged text again does not create a duplicate for devices that already have it. “Delivered” means at least one device received it, not that someone read it.
+- The top line is a status bar: sending/receiving activity on the left, battery percentage on the right. A received message plays a short chime.
+- The display turns off after 10 seconds without input. Any key or button turns it back on; that press only wakes the display. Received messages and send results also turn it on.
 
 ### Pager
 
-Start typing from the conversation to write. Enter or a short wheel click sends the message. Backspace erases. Turn the wheel to read older/newer messages. Hold the wheel for about 0.65 seconds to open quick replies from the conversation, or return from the editor while keeping your draft. Choose a quick reply with the wheel, then press Enter to send.
+Start typing from the conversation to write. Enter or a short wheel click sends the message. Backspace erases. For numbers and symbols, press **Sym** and then the key: the top row types 1–0, and the other keys type the symbol printed on them (for example Sym, V types `?`). Press **Shift** and then a letter for a capital. Pressing Sym or Shift again cancels it; the status bar shows which is active. Sym, Backspace or holding the wheel for about 0.65 seconds leaves the editor and keeps your draft. Turn the wheel to read older/newer messages.
 
 ### Wio L1 OLED
 
-Press the joystick to write. Move it in four directions to choose a key; press to enter it. The final four keys are `_` (space), `<` (erase), `^` (uppercase/lowercase), and `>` (save name or send). The footer describes the selected key. The user button erases a character; when the draft is empty it returns to the conversation.
+Press the joystick to write. Move it in four directions to choose a key; press to enter it. The final four keys are `_` (space), `<` (erase), `^` (uppercase/lowercase), and `>` (save name or send). The footer describes the selected key. In the message editor the user button leaves the editor and keeps your draft; while entering your name it erases a character.
 
-In the conversation, up/down selects messages. Right shows the next page of a long message; right after its final page opens quick replies. Left returns to the previous page. Select a quick reply, then select `>` to send it.
+In the conversation, up/down selects messages. Right shows the next page of a long message and left the previous page.
 
 Sending is queued while the radio needs a pause or detects another transmission. You can cancel before transmission starts. A failed send keeps the text for retry. Messages received while you type are saved without replacing your draft.
 
@@ -76,7 +78,7 @@ The host test suite compiles the actual protocol and application code with fake 
 uv run --with ziglang==0.13.0 tests/run.py
 ```
 
-It checks packet corruption/truncation, maximum lengths, malformed packets with valid checksums, history eviction and duplicate filtering, clock rollover, onboarding, interrupted saves, send/cancel/retry, incoming messages during composition, long-message paging, and quick replies. See [docs/validation.md](docs/validation.md) for the actual build/test results and outstanding hardware checks.
+It checks packet corruption/truncation, maximum lengths, malformed packets with valid checksums, history eviction and duplicate filtering, clock rollover, onboarding, interrupted saves, send/cancel/retry, delivery acknowledgements, incoming messages during composition, long-message paging, leaving the editor, and display sleep. See [docs/validation.md](docs/validation.md) for the actual build/test results and outstanding hardware checks.
 
 If local policy prevents executing newly compiled programs, `tests/run.py --compile-only` checks compilation without executing the tests. This is not a substitute for a passing test run.
 

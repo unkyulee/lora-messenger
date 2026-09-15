@@ -7,6 +7,7 @@ namespace chat {
 constexpr size_t NameMax = 16, TextMax = 160, HistoryMax = 24;
 constexpr size_t PacketMax = 24 + NameMax + TextMax + 4;
 constexpr size_t SnapshotMax = 10 + NameMax + HistoryMax * (2 + PacketMax) + 4;
+constexpr size_t AckSize = 32;
 
 inline uint32_t crc32(const uint8_t* p, size_t n) {
     uint32_t crc = ~uint32_t(0);
@@ -69,6 +70,32 @@ inline bool decode(const uint8_t* p,size_t n,Message& out) {
     if(!m.sender || !m.session || !m.sequence) return false;
     memcpy(m.name,p+24,nl); memcpy(m.text,p+24+nl,tl); out=m; return true;
 }
+// Acknowledgement of one message identity, sent by the receiving device `from`.
+struct Ack {
+    uint64_t sender=0;
+    uint32_t session=0, sequence=0;
+    uint64_t from=0;
+};
+inline bool acknowledges(const Ack& a,const Message& m) {
+    return a.sender==m.sender && a.session==m.session && a.sequence==m.sequence;
+}
+inline size_t encodeAck(const Ack& a,uint8_t* out,size_t capacity) {
+    if(capacity<AckSize || !a.sender || !a.session || !a.sequence || !a.from) return 0;
+    memcpy(out,"LMA1",4);
+    put32(out+4,uint32_t(a.sender)); put32(out+8,uint32_t(a.sender>>32));
+    put32(out+12,a.session); put32(out+16,a.sequence);
+    put32(out+20,uint32_t(a.from)); put32(out+24,uint32_t(a.from>>32));
+    put32(out+28,crc32(out,28)); return AckSize;
+}
+inline bool decodeAck(const uint8_t* p,size_t n,Ack& out) {
+    if(n!=AckSize || memcmp(p,"LMA1",4) || get32(p+28)!=crc32(p,28)) return false;
+    Ack a;
+    a.sender=uint64_t(get32(p+4)) | uint64_t(get32(p+8))<<32;
+    a.session=get32(p+12); a.sequence=get32(p+16);
+    a.from=uint64_t(get32(p+20)) | uint64_t(get32(p+24))<<32;
+    if(!a.sender || !a.session || !a.sequence || !a.from) return false;
+    out=a; return true;
+}
 struct State {
     uint32_t generation=0;
     char name[NameMax+1]={};
@@ -123,10 +150,20 @@ inline bool restore(const uint8_t* p,size_t n,State& out) {
 }
 inline bool newer(uint32_t a,uint32_t b) { return int32_t(a-b)>0; }
 inline bool due(uint32_t now,uint32_t deadline) { return int32_t(now-deadline)>=0; }
-// A conservative 5% scheduler: charge every attempted transmission, including failures.
+// A conservative 5% airtime budget. Credit accrues at 1 ms of airtime per 20 ms,
+// starts empty at boot (rebooting cannot bypass it) and is capped at CapMs so a
+// burst stays short. Every attempted transmission is charged, including failures.
 struct AirtimeGate {
-    uint32_t next=0;
-    bool ready(uint32_t now) const { return due(now,next); }
-    void charge(uint32_t now,uint32_t airtimeMs) { next=now+airtimeMs*20+100; }
+    static constexpr uint32_t CapMs=4000;
+    uint32_t last=0, credit=0; // credit is stored as elapsed ms, i.e. airtime x 20
+    void start(uint32_t now) { last=now; credit=0; }
+    void update(uint32_t now) {
+        const uint32_t elapsed=now-last, cap=CapMs*20;
+        last=now; credit=elapsed>=cap-credit ? cap : credit+elapsed;
+    }
+    bool ready(uint32_t now,uint32_t airtimeMs) { update(now); return credit>=airtimeMs*20; }
+    void charge(uint32_t now,uint32_t airtimeMs) {
+        update(now); credit=credit>airtimeMs*20 ? credit-airtimeMs*20 : 0;
+    }
 };
 }

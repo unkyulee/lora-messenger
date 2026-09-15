@@ -1,6 +1,6 @@
 # Implementation notes
 
-`src/main.cpp` owns the onboarding, inbox, editor, quick-reply selection, outgoing queue, and persistence. All state changes occur on the Arduino loop task. Device adapters provide input, display drawing, identity, entropy, and file access. `src/radio.cpp` configures the matching RadioLib driver. Radio interrupts only set a flag; SPI and application work happen in the loop.
+`src/main.cpp` owns the onboarding, inbox, editor, outgoing queue, acknowledgements, display sleep, and persistence. All state changes occur on the Arduino loop task. Device adapters provide input, display drawing, identity, entropy, and file access. `src/radio.cpp` configures the matching RadioLib driver. Radio interrupts only set a flag; SPI and application work happen in the loop.
 
 ## Public packet v1
 
@@ -27,9 +27,22 @@ Two alternating snapshots (`/chat0` and `/chat1`) contain `LMS1`, a 32-bit gener
 
 Wio uses the Arduino core's 28 KB internal LittleFS area at `0xED000`; the external QSPI chip is not used. Pager uses ESP32 LittleFS in the data partition. These libraries may format an unmountable filesystem on initial mount; the two-slot mechanism protects individual interrupted snapshots, not complete filesystem corruption or chip failure. Drafts are held only in RAM.
 
+## Acknowledgement packet
+
+| Offset | Length | Meaning |
+| --- | --- | --- |
+| 0 | 4 | ASCII `LMA1` |
+| 4 | 8 | Acknowledged message's device identity |
+| 12 | 4 | Acknowledged message's session |
+| 16 | 4 | Acknowledged message's sequence |
+| 20 | 8 | Acknowledging device identity |
+| 28 | 4 | IEEE CRC-32 over all previous bytes |
+
+Every device that decodes a valid message from another device schedules one acknowledgement, including for duplicates (the sender may have missed the first one). It waits a random 150–1049 ms so that several receivers rarely collide, performs CAD, and drops the acknowledgement if it cannot start before the sender's window closes. The sender listens for 3 s after its transmission completes; the first acknowledgement from another device marks the message delivered and adds it to history. Without one, the editor reopens with the text as "Not delivered". Resending unchanged text reuses the message identity, so receivers deduplicate it. An acknowledgement shows that at least one device decoded the message; it is not authenticated and does not identify a reader. Firmware without acknowledgements will make these senders report every message as not delivered.
+
 ## Radio scheduling
 
-The next attempt starts no earlier than 20 times the previous packet's rounded-up airtime plus 100 ms after the attempt began. Failed attempts are also charged. Boot reserves the maximum-packet interval. A queued message observes a randomized initial delay and CAD backoff and expires after 90 seconds; cancellation/expiry/failure preserves its draft. The CAD interrupt wait is bounded to 250 ms; a missing interrupt is treated as a busy channel. There are no automatic repeats or delivery acknowledgements.
+Transmissions draw on an airtime budget: credit accrues at 1 ms of airtime per 20 ms elapsed (5%), starts empty at boot so power cycling cannot bypass it, and is capped at 4 s of airtime, so any hour stays below about 5.1%. Every attempted transmission, including acknowledgements and failures, is charged its rounded-up airtime. A per-transmission pause was replaced because it blocked acknowledgements for up to 20 s after a device's own message. A queued message observes a randomized initial delay and CAD backoff and expires after 90 seconds; cancellation/expiry/failure preserves its draft. CAD is a courtesy, not the regulatory limit (the airtime budget is): the scan result is polled over SPI for up to 250 ms, only detected LoRa activity counts as busy, and after 5 busy results for a message (2 for an acknowledgement) the device transmits anyway. This keeps a noisy receiver front end, such as the Pager's, from blocking sending indefinitely. There are no automatic repeats.
 
 Both board drivers must have matching modulation settings, CRC, sync word, headers, and IQ. RadioLib initializes explicit headers and normal IQ. Pager uses the official library's power sequencing and, for LR1121, its RF-switch table. Wio uses SX1262 DIO2 switching, DIO3 1.8 V TCXO, and P1.08 as the external RX-enable signal. See the physical validation list before calling this radio-tested.
 

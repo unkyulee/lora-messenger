@@ -50,22 +50,26 @@ int radioReceive(uint8_t* p,size_t cap) {
 }
 bool radioBusy() {
     if(transmitting || interrupt) return true;
-    // RadioLib's synchronous CAD waits indefinitely for its IRQ. Bound this
-    // wait so a missing interrupt cannot trap the user on the sending screen.
+    // RadioLib's synchronous CAD waits indefinitely for its IRQ. Poll the IRQ status
+    // over SPI instead of the DIO1 pin level, bounded so a missing result cannot trap
+    // the user on the sending screen.
     int result=radio.startChannelScan();
     const uint32_t scanStart=millis();
-#ifdef DEVICE_PAGER
-    constexpr int irqPin=LORA_IRQ;
-#else
-    constexpr int irqPin=1;
-#endif
     if(result==RADIOLIB_ERR_NONE) {
-        while(!digitalRead(irqPin) && millis()-scanStart<250) delay(1);
-        result=digitalRead(irqPin) ? radio.getChannelScanResult() : RADIOLIB_ERR_RX_TIMEOUT;
+        do { delay(2); result=radio.getChannelScanResult(); }
+        while(result==RADIOLIB_ERR_UNKNOWN && millis()-scanStart<250);
     }
     radio.standby(); interrupt=false;
     radio.startReceive();
-    return result!=RADIOLIB_CHANNEL_FREE;
+    // Only detected LoRa activity counts as busy; a missing result or radio error is
+    // not evidence of traffic and must not hold transmissions back.
+    const bool busy=result==RADIOLIB_LORA_DETECTED;
+    if(result!=RADIOLIB_CHANNEL_FREE) {
+        const char* reason=busy ? "LoRa activity" : result==RADIOLIB_ERR_UNKNOWN ? "no scan result" : "radio error";
+        Serial.printf("[radio] channel check: %s (%d) after %lu ms%s\n",reason,result,
+            (unsigned long)(millis()-scanStart),busy ? "" : ", treating as free");
+    }
+    return busy;
 }
 bool radioSend(const uint8_t* p,size_t n) {
     radio.standby(); interrupt=false;

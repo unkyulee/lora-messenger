@@ -1,15 +1,25 @@
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
-enum class Key { None, Character, Up, Down, Left, Right, Select, Back, Send, Quick };
+// Modifier: a keyboard modifier changed (no action, but it counts as activity).
+enum class Key { None, Character, Up, Down, Left, Right, Select, Back, Send, Quick, Modifier };
 struct Input { Key key=Key::None; char character=0; };
 // Eight rows of 21 characters on Wio; eight rows of 40 characters on Pager.
+// Row 0 is the status bar.
 struct Screen { char lines[8][41]={}; uint8_t highlight=255, caretRow=255, caretColumn=0; };
 bool deviceBegin();
 void deviceTick();
 Input deviceInput();
 void deviceDraw(const Screen& screen);
+// Turn the display and its backlight off or on; the caller redraws after waking.
+void deviceDisplay(bool on);
 int deviceColumns();
+// Battery charge 0-100, or -1 when unknown.
+int deviceBattery();
+// Short notification sound for a received message.
+void deviceChime();
+// Active keyboard modifier label, "" when none. Returns string literals.
+const char* deviceModifier();
 uint64_t deviceId();
 uint32_t deviceRandom();
 bool storageBegin();
