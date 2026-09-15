@@ -67,7 +67,9 @@ void deviceDraw(const Screen& s) {
     }
     // LilyGo's SPI driver expects pixels in wire byte order.
     canvas->byteSwap();
-    instance.lockSPI(); instance.pushColors(0,0,480,222,canvas->getBuffer()); instance.unlockSPI();
+    // pushColors takes the shared SPI mutex itself; that mutex is not
+    // recursive, so wrapping this call in lockSPI() deadlocks the first draw.
+    instance.pushColors(0,0,480,222,canvas->getBuffer());
 }
 uint64_t deviceId() { return ESP.getEfuseMac(); }
 uint32_t deviceRandom() { return esp_random(); }

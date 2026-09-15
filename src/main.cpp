@@ -182,9 +182,10 @@ void draw() {
 void setup() {
     displayOK=deviceBegin();
     if(!displayOK) {
-        Serial.println("Startup stopped: display/input initialization failed.");
-        while(true) delay(250);
+        // Repeat: USB serial drops output sent before a monitor is attached.
+        while(true) { Serial.println("Startup stopped: display/input initialization failed."); delay(2000); }
     }
+    Serial.printf("[boot] display/input ok, starting storage\n");
     storageOK=storageBegin();
     static chat::State candidate;
     if(storageOK) for(int slot=0;slot<2;++slot) {
@@ -193,10 +194,13 @@ void setup() {
             state=candidate; activeSlot=slot;
         }
     }
+    Serial.printf("[boot] storage %s, slot %d, %u messages\n",storageOK ? "ok" : "FAILED",activeSlot,unsigned(state.count));
     session=deviceRandom()|1u;
     view=state.name[0] ? View::Inbox : View::Name;
     if(state.count) selected=state.count-1;
+    Serial.printf("[boot] starting radio\n");
     radioOK=radioBegin();
+    Serial.printf("[boot] radio %s, drawing first screen\n",radioOK ? "ok" : "FAILED");
     // Even repeated power cycles cannot bypass the inter-transmission pause.
     gate.next=millis()+(radioOK ? radioAirtime(chat::PacketMax)*20+100 : 30000);
     if(!displayOK) Serial.println("Display/input initialization failed");

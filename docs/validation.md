@@ -12,6 +12,22 @@ All three corrected targets built successfully, and `scripts/package.py` verifie
 
 Reference: [LILYGO Pager board definition](https://github.com/Xinyuan-LilyGO/LilyGoLib-PlatformIO/blob/master/boards/lilygo-t-lora-pager.json).
 
+## Pager blank display correction
+
+With the PSRAM fix the Pager booted (I2C scan printed, keyboard at `0x34` found) but the display stayed blank. `deviceDraw` wrapped `instance.pushColors()` in `instance.lockSPI()`/`unlockSPI()`. LilyGoLib's `LilyGoDispArduinoSPI::pushColors` takes that same non-recursive FreeRTOS mutex with `portMAX_DELAY`, so the first frame deadlocked `setup()`. The outer lock was removed. The `Wire.cpp setPins(): bus already initialized` message comes from the fuel-gauge driver re-applying pins after `Wire.begin` and is harmless. Not yet confirmed on hardware.
+
+## Wio blank display investigation
+
+Reported blank after flashing. Static checks found no pin or driver defect: the built ELF's `g_ADigitalPinMap` matches Meshtastic's `seeed_wio_tracker_L1` variant entry for entry (OLED SDA D14 = P0.06, SCL D15 = P0.05), Meshtastic selects `USE_SSD1306` for this board with no display power pin, the `dist/` UF2 is byte-identical to the build, and InternalFS flash operations return without waiting when the SoftDevice is disabled.
+
+Two gaps made the failure undiagnosable. `Adafruit_SSD1306::begin` reports success without any I2C acknowledgement, and the first frame was only sent after storage and radio setup. `deviceBegin` now probes `0x3C` (failing startup with a serial message if nothing answers) and immediately shows `Starting...`. Not yet built or confirmed on hardware.
+
+The user reported a Wio Tracker L1 Pro with no serial output. Seeed lists the same 1.3" 128×64 OLED for the Pro; Meshtastic's `seeed_wio_tracker_L1_Pro_1W` variant keeps SSD1306 on P0.06/P0.05 but adds a radio LDO enable (P0.14) and moves D5 to P0.29 (`LORA_VDET`), which this firmware does not yet handle. Boot diagnostics were added: Wio waits up to 5 s for a USB serial monitor, prints an I2C scan, and `setup()` logs each stage (`[wio]`/`[boot]` lines). The Wio LED stays lit during setup and blinks once `loop()` runs.
+
+The diagnostics identified the cause: the L1 Pro's I2C scan found only `0x3D`, and the probe of `0x3C` failed. The firmware previously hard-coded `0x3C`, so every display write went unacknowledged. `deviceBegin` now probes `0x3C` then `0x3D` and uses the one that answers. Not yet confirmed on hardware.
+
+With the address fixed, only the top text row updated and the previous Meshtastic screen remained below it. That is an SH1106 driven by the SSD1306 driver: the SH1106 ignores SSD1306 column/page window commands, so every frame lands in page 0. Meshtastic identifies the controller at runtime from the status register's low nibble (0x08/0x00 = SH1106), overriding the board's `USE_SSD1306`. The Wio adapter now applies the same probe, then uses `Adafruit_SH1106G` (Adafruit SH110X 2.1.15) or `Adafruit_SSD1306`, and logs the result. Not yet confirmed on hardware.
+
 ## Automated checks
 
 - Corrected combined build passed for all three targets on 2026-09-15. See `build/psram-fix-builds.log`.
