@@ -3,6 +3,9 @@
 #include <Adafruit_TinyUSB.h>
 #include "device.h"
 #include "network.h"
+#include "power_button.h"
+
+void relayRadioOff();
 
 namespace {
 network::Relay relay;
@@ -10,14 +13,36 @@ chat::AirtimeGate gate;
 uint8_t packet[network::PacketMax];
 bool ready=false, sending=false;
 uint32_t reportAt=0, forwarded=0;
+PowerButton powerButton;
+bool shutdownRequested=false;
+void powerOff() {
+    relayRadioOff();
+    digitalWrite(LED_BUILTIN,LOW);
+    TinyUSBDevice.detach();
+    NRF_USBD->ENABLE=0;
+    // P0.06 is active high. Shutdown occurs only after button release.
+    systemOff(PIN_BUTTON1,HIGH);
+    // System OFF returns only in debug emulation; never resume forwarding.
+    while(true) { __WFE(); }
+}
 }
 void setup() {
     Serial.begin(115200);
+    pinMode(PIN_BUTTON1,INPUT_PULLDOWN);
+    powerButton.begin(digitalRead(PIN_BUTTON1)==HIGH,millis());
     randomSeed(NRF_FICR->DEVICEID[0]^NRF_FICR->DEVICEID[1]^micros());
     ready=radioBegin(); gate.start(millis());
 }
 void loop() {
     const uint32_t now=millis();
+    if(powerButton.update(digitalRead(PIN_BUTTON1)==HIGH,now)) shutdownRequested=true;
+    if(sending && radioResult()) sending=false;
+    // Finish an in-flight packet, but admit no further work once shutdown is armed.
+    if(powerButton.armed) {
+        digitalWrite(LED_BUILTIN,HIGH); // release button to switch off
+        if(shutdownRequested && !sending && digitalRead(PIN_BUTTON1)==LOW) powerOff();
+        delay(5); return;
+    }
     if(chat::due(now,reportAt)) {
         reportAt=now+10000;
         Serial.printf("[relay] radio=%s forwarded=%lu\n",ready?"ready":"FAILED",(unsigned long)forwarded);
@@ -25,7 +50,6 @@ void loop() {
     // A short heartbeat; fast blinking reports radio startup failure.
     digitalWrite(LED_BUILTIN,now%(ready?5000:500)<50);
     if(!ready) { delay(10); return; }
-    if(sending && radioResult()) sending=false;
     int n=radioReceive(packet,sizeof(packet));
     network::Frame f;
     if(n>0 && network::decode(packet,size_t(n),f)) relay.accept(f,now,uint32_t(random(0x7fffffff)));

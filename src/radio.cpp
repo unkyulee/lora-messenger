@@ -116,3 +116,17 @@ int radioResult() {
     return completed && finish==RADIOLIB_ERR_NONE ? 1 : -1;
 }
 uint32_t radioAirtime(size_t n) { return (radio.getTimeOnAir(n)+999)/1000; }
+
+#ifdef DEVICE_RELAY
+void relayRadioOff() {
+    radio.standby();
+    radio.clearPacketReceivedAction();
+    radio.clearPacketSentAction();
+    // Cold sleep disables the receiver and TCXO; a wake starts a fresh boot.
+    if(radio.sleep(false,0)!=RADIOLIB_ERR_NONE) {
+        pinMode(42,OUTPUT); digitalWrite(42,LOW); // failed radio held in reset
+    }
+    transmitting=false; interrupt=false;
+    SPI.end();
+}
+#endif

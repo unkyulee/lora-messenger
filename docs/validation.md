@@ -1,3 +1,9 @@
+## SenseCAP button power update
+
+The relay power-control build passed (`build/sensecap-power-build.log`): 16,656 bytes static RAM, 94,300 bytes application flash. Its 369-block UF2 passed packaging validation and replaced the relay file/checksum in `dist`; handheld images were not changed. The executed host suite passed button debounce, startup/wake press suppression, five-second hold, release-before-off, and clock rollover, plus the existing protocol, relay and application tests.
+
+Physical checks remain: hold for five seconds and release during idle and transmission; confirm LED/radio/USB switch off; press once to wake; keep the wake button held and confirm it does not shut down again. Repeat with USB attached and disconnected, check reconnect behavior, and measure shutdown current. System OFF is a low-power state, not battery disconnection. No device was flashed automatically.
+
 # Relay update ? 2026-09-16
 
 The executed host suite passes with Zig 0.13.0 and `-Wall -Wextra -Werror`. It covers the new envelope, malformed/corrupt packets, relay duplicate suppression, hop-limit loop prevention, ACK priority, reserved queue capacity, expiry across clock rollover, lost-ACK retries with stable identity, bounded attempt exhaustion, ACK suppression on storage failure, and existing UI/persistence behavior. The earlier Windows execution restriction described below did not occur in this run.

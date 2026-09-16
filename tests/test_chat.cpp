@@ -3,6 +3,7 @@
 #include <vector>
 #include <random>
 #include "chat.h"
+#include "power_button.h"
 #include "device.h"
 #include "Arduino.h"
 uint32_t fakeTime=100;
@@ -231,4 +232,21 @@ void relayTests() {
     assert(full.accept(ack,0,0)); // data cannot consume ACK slots
     puts("PASS: relay hop limit, duplicate caches, retries, ACK priority, queue bounds, expiry and rollover");
 }
-int main() { protocolTests(); relayTests(); appTests(); puts("All tests passed."); }
+void powerTests() {
+    PowerButton b; b.begin(true,0);
+    assert(!b.update(true,10000) && !b.armed); // held wake press ignored
+    assert(!b.update(false,10001)); assert(!b.update(false,10031));
+    assert(!b.update(true,10100)); assert(!b.update(false,10110));
+    assert(!b.update(false,10140) && !b.armed); // bounce cannot arm
+    assert(!b.update(true,10200)); assert(!b.update(true,10230));
+    assert(!b.update(true,15229) && !b.armed);
+    assert(!b.update(true,15230) && b.armed); // wait for release
+    assert(!b.update(false,15231)); assert(b.update(false,15261));
+    b.begin(false,0xffffff00u); b.update(false,0xffffff30u);
+    b.update(true,0xffffff40u); b.update(true,0xffffff70u);
+    assert(!b.update(true,0xffffff70u+5000u) && b.armed);
+    assert(!b.update(false,0xffffff70u+5001u));
+    assert(b.update(false,0xffffff70u+5031u));
+    puts("PASS: power button wake guard, debounce, hold/release and clock rollover");
+}
+int main() { powerTests(); protocolTests(); relayTests(); appTests(); puts("All tests passed."); }
