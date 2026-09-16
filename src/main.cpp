@@ -1,18 +1,20 @@
+#ifndef DEVICE_RELAY
 #include <Arduino.h>
 #include <stdio.h>
 #include "chat.h"
+#include "network.h"
 #include "device.h"
 
 namespace {
 constexpr uint32_t NoticeMs=4000, ScreenTimeoutMs=10000, BatteryPeriodMs=30000;
 // After its transmission completes, a sender listens this long for any receiver's acknowledgement.
-constexpr uint32_t AckWindowMs=3000;
+constexpr uint32_t AckWindowMs=network::AckWindow;
 // Channel activity detection is a courtesy; the airtime budget bounds transmissions.
 // After this many busy results, send anyway so a noisy receiver front end cannot block sending.
 constexpr unsigned MaxBusyChecks=5, MaxAckBusyChecks=2;
 chat::State state;
 chat::Message pending;
-uint8_t snapshot[chat::SnapshotMax], packet[chat::PacketMax], outgoing[chat::PacketMax];
+uint8_t snapshot[chat::SnapshotMax], packet[network::PacketMax], outgoing[network::PacketMax];
 size_t outgoingLength=0;
 enum class View { Name, Inbox, Compose };
 enum class Tx { None, Message, Ack };
@@ -30,8 +32,12 @@ bool queued=false, sending=false, awaiting=false, retryable=false, upper=false;
 const char* modifier="";
 unsigned unread=0;
 chat::AirtimeGate gate;
-struct PendingAck { chat::Ack ack; uint32_t due=0, expires=0; unsigned busyChecks=0; bool used=false; };
+struct PendingAck { chat::Ack ack; uint8_t attempt=0; uint32_t due=0, expires=0; unsigned busyChecks=0; bool used=false; };
 PendingAck acks[4];
+network::Seen<64> acknowledged;
+uint8_t attempt=0;
+uint32_t deliveryDeadline=0;
+size_t encodePending() { network::Frame f; f.message=pending; f.attempt=attempt; return network::encode(f,outgoing,sizeof(outgoing)); }
 constexpr char keymap[]="abcdefghijklmnopqrstuvwxyz0123456789_<^>";
 
 void notify(const char* text) {
@@ -71,58 +77,64 @@ void submit() {
         draft[0]=0; view=View::Inbox; dirty=true; return;
     }
     if(!radioOK) { notify("Radio unavailable"); return; }
-    // Unchanged text keeps its identity, so a receiver whose acknowledgement
-    // was lost does not store the resent message twice.
-    if(!retryable || strcmp(pending.text,draft)) {
+    // Within a delivery, unchanged text keeps its identity. An explicit send
+    // after exhaustion/expiry starts a new delivery.
+    if(!retryable || strcmp(pending.text,draft) || attempt+1>=network::Attempts || chat::due(millis(),deliveryDeadline)) {
+        attempt=0; deliveryDeadline=millis()+network::Lifetime;
         pending=chat::Message{}; pending.sender=deviceId(); pending.session=session;
         pending.sequence=++sequence;
         if(!sequence) { session=deviceRandom()|1u; pending.session=session; pending.sequence=++sequence; }
         memcpy(pending.name,state.name,sizeof(state.name));
         memcpy(pending.text,draft,strlen(draft)+1);
     }
-    outgoingLength=chat::encode(pending,outgoing,sizeof(outgoing));
+    else ++attempt;
+    outgoingLength=encodePending();
     if(!outgoingLength) { notify("Message cannot be sent"); return; }
     gate.update(millis());
     Serial.printf("[send] queued %u bytes, airtime %u ms, credit %u ms\n",unsigned(outgoingLength),
         unsigned(radioAirtime(outgoingLength)),unsigned(gate.credit/20));
     retryable=true; busyChecks=0;
-    queued=true; queueExpires=millis()+90000; retryAt=millis()+100+(deviceRandom()%500); dirty=true;
+    queued=true; queueExpires=deliveryDeadline; retryAt=millis()+100+(deviceRandom()%500); dirty=true;
 }
 void sendFailed(const char* why) {
     // Back to the editor with the text kept, ready to change or resend.
-    view=View::Compose; keyboard=39; notify(why); setStatus("Not delivered"); wake();
+    view=View::Compose; keyboard=39; notify(why); setStatus("Delivery unconfirmed"); wake();
 }
 void delivered() {
-    awaiting=false; retryable=false;
+    awaiting=false; queued=false; retryable=false;
     state.add(pending); selected=state.count-1; page=0; unread=0;
     draft[0]=0; view=View::Inbox;
     if(!persist()) notify("Sent; history unsaved");
     setStatus("Delivered"); wake();
 }
-void scheduleAck(const chat::Message& m,uint32_t now) {
+void scheduleAck(const chat::Message& m,uint32_t now,uint8_t receivedAttempt=0) {
     PendingAck* slot=nullptr;
     for(auto& a:acks) {
         if(a.used && a.ack.sender==m.sender && a.ack.session==m.session && a.ack.sequence==m.sequence) return;
         if(!a.used && !slot) slot=&a;
     }
     if(!slot) return;
+    network::Frame seen; seen.message=m; seen.attempt=receivedAttempt;
+    if(!acknowledged.insert(seen,now)) return;
+    slot->attempt=receivedAttempt;
     slot->ack=chat::Ack{}; slot->ack.sender=m.sender; slot->ack.session=m.session;
     slot->ack.sequence=m.sequence; slot->ack.from=deviceId();
     // A random delay spreads replies from several receivers; the sender needs only one.
     slot->due=now+150+deviceRandom()%900;
-    slot->expires=now+AckWindowMs-radioAirtime(chat::AckSize)-200;
+    slot->expires=now+AckWindowMs-radioAirtime(chat::AckSize+network::Overhead)-200;
     slot->busyChecks=0; slot->used=true;
 }
 void serviceAcks(uint32_t now) {
     if(tx!=Tx::None) return;
-    const uint32_t air=radioAirtime(chat::AckSize);
+    const uint32_t air=radioAirtime(chat::AckSize+network::Overhead);
     for(auto& a:acks) {
         if(!a.used || !chat::due(now,a.due)) continue;
         if(chat::due(now,a.expires)) { a.used=false; continue; }
         if(!gate.ready(now,air)) continue;
         if(a.busyChecks<MaxAckBusyChecks && radioBusy()) { ++a.busyChecks; a.due=now+200+deviceRandom()%600; continue; }
         a.used=false;
-        size_t n=chat::encodeAck(a.ack,packet,sizeof(packet));
+        network::Frame f; f.ack=true; f.receipt=a.ack; f.attempt=a.attempt;
+        size_t n=network::encode(f,packet,sizeof(packet));
         gate.charge(now,air);
         if(n && radioSend(packet,n)) tx=Tx::Ack;
         return;
@@ -321,11 +333,12 @@ void loop() {
             }
         }
         int n=radioReceive(packet,sizeof(packet));
-        chat::Message incoming;
-        chat::Ack ack;
-        if(n>0 && chat::decode(packet,size_t(n),incoming) && incoming.sender!=deviceId()) {
-            // Acknowledge duplicates too: the sender may have missed the first acknowledgement.
-            scheduleAck(incoming,now);
+        network::Frame frame;
+        const bool valid=n>0 && network::decode(packet,size_t(n),frame);
+        const auto& incoming=frame.message;
+        const auto& ack=frame.receipt;
+        if(valid && !frame.ack && incoming.sender!=deviceId()) {
+            // A new attempt may need an ACK even when the message is already stored.
             bool atEnd=!state.count || selected==state.count-1;
             bool wasFull=state.count==chat::HistoryMax;
             if(state.add(incoming)) {
@@ -334,14 +347,25 @@ void loop() {
                     ++unread;
                     if(wasFull) { if(selected) --selected; else page=0; }
                 }
-                if(!persist()) notify("History not saved");
                 setStatus("New message"); wake(); deviceChime();
             }
-        } else if(n>0 && awaiting && chat::decodeAck(packet,size_t(n),ack) &&
+            // Re-verify storage for a duplicate following an earlier write failure.
+            if(persist()) scheduleAck(incoming,now,frame.attempt);
+            else notify("History not saved");
+        } else if(valid && frame.ack && (awaiting || queued) &&
                   ack.from!=deviceId() && chat::acknowledges(ack,pending)) {
             delivered();
         }
-        if(awaiting && chat::due(now,ackDeadline)) { awaiting=false; sendFailed("Nobody received it"); }
+        if(awaiting && chat::due(now,ackDeadline)) {
+            awaiting=false;
+            if(attempt+1<network::Attempts && !chat::due(now,deliveryDeadline)) {
+                ++attempt; outgoingLength=encodePending(); queued=true; busyChecks=0;
+                retryAt=now+500+deviceRandom()%1500;
+            } else sendFailed("Delivery unconfirmed");
+        }
+        if((queued || awaiting) && chat::due(now,deliveryDeadline)) {
+            queued=false; awaiting=false; sendFailed("Delivery unconfirmed");
+        }
         if(queued && chat::due(now,queueExpires)) { queued=false; notify("Channel busy; retry"); }
         serviceAcks(now);
         if(queued && tx==Tx::None && chat::due(now,retryAt)) {
@@ -364,3 +388,5 @@ void loop() {
     if(dirty && displayOn) draw();
     delay(5);
 }
+
+#endif

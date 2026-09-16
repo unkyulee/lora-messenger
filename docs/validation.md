@@ -1,3 +1,20 @@
+# Relay update ? 2026-09-16
+
+The executed host suite passes with Zig 0.13.0 and `-Wall -Wextra -Werror`. It covers the new envelope, malformed/corrupt packets, relay duplicate suppression, hop-limit loop prevention, ACK priority, reserved queue capacity, expiry across clock rollover, lost-ACK retries with stable identity, bounded attempt exhaustion, ACK suppression on storage failure, and existing UI/persistence behavior. The earlier Windows execution restriction described below did not occur in this run.
+
+Hardware checks remain: boot the T1000-E, inspect its LR1110 initialization result, verify bidirectional Pager?relay?Wio delivery with the direct path unavailable, then remove the relay and confirm timeout preserves the draft. Test duplicate reception where both direct and relayed paths exist; messages should appear once. Run two relays and verify no ping-pong. Confirm idle traffic stops after queued attempts expire, measure airtime and battery current, and test maximum-length packets. Nothing has been flashed or RF-tested in this session.
+
+All four final builds passed (`build/relay-final-build.log`). Packaging passed (`build/relay-package.log`): both application-only UF2 files passed vector, family, address and block checks, and both Pager factory images matched their bootloader, partition table and application. `dist/manifest.json` records the packaged checksums.
+
+| Current target | Static RAM | Application flash |
+| --- | --- | --- |
+| T1000-E relay | 16,640 bytes | 93,660 bytes |
+| Wio L1 OLED | 37,464 bytes | 143,208 bytes |
+| Pager SX1262 | 53,756 bytes | 720,774 bytes |
+| Pager LR1121 | 53,716 bytes | 718,578 bytes |
+
+The older measurements below describe earlier builds, not the relay update.
+
 # Validation record
 
 Firmware for Wio Tracker L1 OLED and LILYGO T-LoRa Pager, Italy profile.
@@ -77,4 +94,4 @@ These checks have **not** been completed. The user tested the initial Pager buil
 7. Send several messages quickly. Confirm the waiting screen, cancellation, channel-busy expiry, and retry behavior. Verify actual modulation, power and airtime with radio test equipment before treating regulatory behavior as established.
 8. Check display orientation, contrast, RGB byte order, and power consumption. Measure battery runtime and low-battery behavior; these builds do not yet implement a validated sleep/battery-management policy.
 
-Saved history is local receive history. Offline catch-up, routing/mesh, delivery acknowledgements, and interoperability with other firmware are outside this version.
+Saved history is local receive history. Offline catch-up, multiple relay hops, and interoperability with other firmware remain outside this version.

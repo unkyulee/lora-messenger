@@ -9,8 +9,8 @@ This is a first hardware-test build. Compilation does not establish that the dis
 - On first startup, enter a name of up to 16 characters and save it.
 - Subsequent startups open the conversation. The most recent 24 sent/received messages are saved in flash.
 - Messages can contain up to 160 printable ASCII characters. Italian accents are not supported yet; use `e'`, for example. The Wio keyboard currently offers letters, numbers, and spaces; the Pager also offers its physical symbol keys.
-- Every transmission is public to compatible devices within direct radio range. Both devices need this firmware; it does **not** exchange messages with Meshtastic, MeshCore, or LoRaWAN.
-- After sending, the device waits up to 3 seconds for an acknowledgement from any device that received the message. The status bar then shows “Delivered”. If nobody acknowledges it, it shows “Not delivered” and reopens the editor with your text; sending the unchanged text again does not create a duplicate for devices that already have it. “Delivered” means at least one device received it, not that someone read it.
+- Every transmission is public to compatible devices within direct radio range or through one T1000-E relay. All devices need this firmware; it does **not** exchange messages with Meshtastic, MeshCore, or LoRaWAN.
+- Sending allows up to three attempts with the same message identity, a 30-second ACK window per transmission, and a two-minute overall deadline. "Delivered" means at least one other handheld saved the message. Otherwise, "Delivery unconfirmed" keeps your draft available. It does not prove that nobody received the message.
 - The top line is a status bar: sending/receiving activity on the left, battery percentage on the right. A received message plays a short chime.
 - The display turns off after 10 seconds without input. Any key or button turns it back on; that press only wakes the display. Received messages and send results also turn it on.
 
@@ -34,6 +34,7 @@ Install PlatformIO Core (or its VS Code extension), Git, and Python. From the pr
 
 ```powershell
 ./scripts/bootstrap.ps1
+pio run -e sensecap_t1000_e_relay
 pio run -e wio_l1_oled
 pio run -e pager_sx1262
 # For a Pager fitted with LR1121 instead:
@@ -56,6 +57,7 @@ The verified local build files are collected in `dist/`:
 
 | Device | File |
 | --- | --- |
+| SenseCAP T1000-E relay | `messenger-sensecap-t1000-e-relay-italy.uf2` |
 | Wio L1 OLED | `messenger-wio-l1-oled-italy.uf2` |
 | Pager with SX1262 | `messenger-pager-sx1262-italy.factory.bin` |
 | Pager with LR1121 | `messenger-pager-lr1121-italy.factory.bin` |
@@ -72,6 +74,16 @@ pio run -e pager_sx1262 -t upload --upload-port COM5
 
 Replace `COM5` with its actual port, and replace the environment with `pager_lr1121` if appropriate. PlatformIO uploads the application and the required ESP32 boot/partition images. An application-only `firmware.bin` is not an image to flash at address zero. Follow [LILYGO's USB download-mode instructions](https://wiki.lilygo.cc/products/t-lora-series/t-lora-pager/quick-start.html) if automatic connection fails.
 
+## SenseCAP T1000-E relay
+
+Build `sensecap_t1000_e_relay` for the **T1000-E with nRF52840/LR1110 and the stock S140 7.3.0 UF2 bootloader**. This is not a T1000-A/B or a generic LoRaWAN image. The relay starts listening immediately; it has no naming screen or configuration menu. GPS, sensors and buzzer are disabled. A brief LED pulse every five seconds indicates the loop is running with a successfully initialized radio; fast blinking indicates initialization failure. USB serial at 115200 reports status every ten seconds. Battery runtime has not been measured.
+
+Update the Pager and Wio as well: the new `LMR2` radio packets are incompatible with the earlier firmware. Existing handheld names and stored history keep the same format.
+
+To flash, connect the magnetic USB cable to your computer. Hold the device button while quickly reconnecting the magnetic end twice to enter the stock DFU drive, then copy `dist/messenger-sensecap-t1000-e-relay-italy.uf2` to that drive. See [Seeed's DFU instructions](https://wiki.seeedstudio.com/sensecap_t1000_e/#step-1-enter-dfu-mode) if the drive does not appear. This application-only UF2 does not replace the bootloader or SoftDevice. No automatic flash is performed by the build or packaging scripts.
+
+The relay forwards messages and recipient ACKs, but never claims delivery itself. Packets carry a one-step forwarding limit, and duplicate attempts are suppressed. ACKs have queue priority and reserved slots. All transmissions share the airtime budget. No stored traffic is retransmitted after a relay restart. Place it where it can hear both handhelds; chaining two relays is deliberately unsupported in this version.
+
 ## Verification
 
 The host test suite compiles the actual protocol and application code with fake devices:
@@ -86,9 +98,9 @@ If local policy prevents executing newly compiled programs, `tests/run.py --comp
 
 ## Scope and radio profile
 
-This version uses a direct broadcast link, with no relaying, automatic retransmission, encryption, authenticated names, GPS, or phone connection. History contains messages that the device actually received; it does not fetch messages sent while it was off. Battery runtime, sleep behavior, and low-battery handling are not yet validated for unattended use.
+This version supports direct broadcast and one relay forwarding step, with bounded automatic retries. It has no encryption, authenticated names, GPS, or phone connection. History contains messages that the device actually received; it does not fetch messages sent while it was off. Battery runtime, sleep behavior, and low-battery handling are not yet validated for unattended use.
 
-The fixed profile is 869.525 MHz, 125 kHz bandwidth, SF9, coding rate 4/5, 14 dBm chip output, eight-symbol preamble, explicit headers, normal IQ, sync word `0x12`, and packet CRC enabled. Firmware imposes a conservative 5% transmission schedule and a maximum-packet pause after boot so rebooting cannot bypass it. Channel activity detection adds randomized backoff. There is no setting to override these limits.
+The fixed profile is 869.525 MHz, 125 kHz bandwidth, SF9, coding rate 4/5, 14 dBm chip output, eight-symbol preamble, explicit headers, normal IQ, sync word `0x12`, and packet CRC enabled. Firmware imposes a conservative 5% transmission schedule with an empty airtime budget after boot so rebooting cannot bypass it. Channel activity detection adds randomized backoff. There is no setting to override these limits.
 
 The selected band lies within the EU 869.4–869.65 MHz non-specific short-range-device allocation. The harmonised conditions allow up to 500 mW ERP with applicable access restrictions, including a duty-cycle alternative of 10%; this implementation selects a lower chip output and a 5% schedule. Antenna gain and actual hardware emissions remain part of physical validation. Sources: [EU Decision 2025/105, band 54](https://eur-lex.europa.eu/eli/dec_impl/2025/105/oj/eng), [Meshtastic EU_868 reference](https://meshtastic.org/docs/configuration/radio/lora/).
 

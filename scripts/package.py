@@ -1,6 +1,6 @@
 """Verify build artifacts and collect firmware for local hardware testing.
 
-Run after all three PlatformIO builds: python scripts/package.py
+Run after all four PlatformIO builds: python scripts/package.py
 This script never accesses a serial port or flashes a device.
 """
 from pathlib import Path
@@ -62,6 +62,7 @@ def verify_pager(directory):
 def main():
     builds = ROOT / ".pio/build"
     specifications = [
+        ("sensecap_t1000_e_relay", "firmware.uf2", "messenger-sensecap-t1000-e-relay-italy.uf2"),
         ("wio_l1_oled", "firmware.uf2", "messenger-wio-l1-oled-italy.uf2"),
         ("pager_sx1262", "firmware.factory.bin", "messenger-pager-sx1262-italy.factory.bin"),
         ("pager_lr1121", "firmware.factory.bin", "messenger-pager-lr1121-italy.factory.bin"),

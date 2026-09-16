@@ -6,7 +6,11 @@
 #include <LilyGoLib.h>
 #else
 #include <SPI.h>
+#ifdef DEVICE_RELAY
+static LR1110 radio=new Module(12,33,42,7);
+#else
 static SX1262 radio=new Module(4,1,2,3);
+#endif
 #endif
 
 static volatile bool interrupt=false;
@@ -21,12 +25,29 @@ bool radioBegin() {
 #ifdef DEVICE_PAGER
     if(!instance.initLoRa()) return false;
     if(radio.setTCXO(3.0)!=RADIOLIB_ERR_NONE) return false;
+#elif defined(DEVICE_RELAY)
+    SPI.begin();
+    int result=radio.begin(869.525,125.0,9,5,0x12,14,8,1.6);
+    Serial.printf("[relay] LR1110 begin: %d\n",result);
+    if(result!=RADIOLIB_ERR_NONE) return false;
+    static const uint32_t pins[Module::RFSWITCH_MAX_PINS]={RADIOLIB_LR11X0_DIO5,
+        RADIOLIB_LR11X0_DIO6,RADIOLIB_LR11X0_DIO7,RADIOLIB_LR11X0_DIO8,RADIOLIB_NC};
+    static const Module::RfSwitchMode_t modes[]={
+        {LR11x0::MODE_STBY,{LOW,LOW,LOW,LOW}},
+        {LR11x0::MODE_RX,{HIGH,LOW,LOW,HIGH}},
+        {LR11x0::MODE_TX,{HIGH,HIGH,LOW,HIGH}},
+        {LR11x0::MODE_TX_HP,{LOW,HIGH,LOW,HIGH}},
+        {LR11x0::MODE_TX_HF,{LOW,LOW,LOW,LOW}},
+        {LR11x0::MODE_GNSS,{LOW,LOW,HIGH,LOW}},
+        {LR11x0::MODE_WIFI,{LOW,LOW,LOW,LOW}}, END_OF_MODE_TABLE
+    };
+    radio.setRfSwitchTable(pins,modes);
 #else
     SPI.begin();
     if(radio.begin(869.525,125.0,9,5,0x12,14,8,1.8)!=RADIOLIB_ERR_NONE) return false;
     radio.setRfSwitchPins(5,RADIOLIB_NC);
 #endif
-#ifndef ARDUINO_LILYGO_LORA_LR1121
+#if !defined(ARDUINO_LILYGO_LORA_LR1121) && !defined(DEVICE_RELAY)
     if(radio.setDio2AsRfSwitch(true)!=RADIOLIB_ERR_NONE) return false;
 #endif
     if(radio.setFrequency(869.525)!=RADIOLIB_ERR_NONE ||
@@ -84,7 +105,7 @@ int radioResult() {
     if(!transmitting) return 0;
     if(!interrupt && millis()-started<5000) return 0;
     // Check the actual TX-done IRQ: a timeout must never appear as success.
-#ifdef ARDUINO_LILYGO_LORA_LR1121
+#if defined(ARDUINO_LILYGO_LORA_LR1121) || defined(DEVICE_RELAY)
     bool completed=interrupt && (radio.getIrqFlags() & RADIOLIB_LR11X0_IRQ_TX_DONE);
 #else
     bool completed=interrupt && (radio.getIrqFlags() & RADIOLIB_SX126X_IRQ_TX_DONE);

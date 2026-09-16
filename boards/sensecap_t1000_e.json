@@ -1,0 +1,72 @@
+{
+  "build": {
+    "arduino": {
+      "ldscript": "nrf52840_s140_v7.ld"
+    },
+    "core": "nRF5",
+    "cpu": "cortex-m4",
+    "mcu": "nrf52840",
+    "extra_flags": "-DARDUINO_WIO_WM1110 -DNRF52840_XXAA",
+    "f_cpu": "64000000L",
+    "variant": "sensecap_t1000_e",
+    "variants_dir": "variants",
+    "bsp": {
+      "name": "adafruit"
+    },
+    "usb_product": "LoRa Messenger Relay",
+    "softdevice": {
+      "sd_flags": "-DS140",
+      "sd_name": "s140",
+      "sd_version": "7.3.0",
+      "sd_fwid": "0x0123"
+    },
+    "bootloader": {
+      "settings_addr": "0xFF000"
+    },
+    "hwids": [
+      [
+        "0x239A",
+        "0x8029"
+      ],
+      [
+        "0x239A",
+        "0x0029"
+      ],
+      [
+        "0x239A",
+        "0x002A"
+      ],
+      [
+        "0x239A",
+        "0x802A"
+      ],
+      [
+        "0x2886",
+        "0x0057"
+      ]
+    ]
+  },
+  "debug": {
+    "jlink_device": "nRF52840_xxAA",
+    "svd_path": "nrf52840.svd"
+  },
+  "frameworks": [
+    "arduino"
+  ],
+  "name": "SenseCAP Card Tracker T1000-E Relay",
+  "upload": {
+    "maximum_ram_size": 237568,
+    "maximum_size": 811008,
+    "speed": 115200,
+    "protocol": "nrfutil",
+    "protocols": [
+      "nrfutil",
+      "jlink"
+    ],
+    "use_1200bps_touch": true,
+    "require_upload_port": true,
+    "wait_for_upload_port": true
+  },
+  "url": "https://wiki.seeedstudio.com/t1000_e_intro/",
+  "vendor": "Seeed Studio"
+}

@@ -51,21 +51,23 @@ void key(Key k,char c=0) {
     if(!displayOn) { nextInput={Key::Up,0}; loop(); } // the waking press is consumed
     nextInput={k,c}; loop();
 }
-void deliver(const chat::Message& m) {
-    uint8_t b[chat::PacketMax]; size_t n=chat::encode(m,b,sizeof(b));
+void deliver(const chat::Message& m,uint8_t attemptNumber=0) {
+    network::Frame f; f.message=m; f.attempt=attemptNumber;
+    uint8_t b[network::PacketMax]; size_t n=network::encode(f,b,sizeof(b));
     assert(n); received.assign(b,b+n); loop();
 }
 void deliverAck(const chat::Message& m,uint64_t from=555) {
     chat::Ack a; a.sender=m.sender; a.session=m.session; a.sequence=m.sequence; a.from=from;
-    uint8_t b[chat::AckSize]; size_t n=chat::encodeAck(a,b,sizeof(b));
+    network::Frame f; f.ack=true; f.receipt=a;
+    uint8_t b[network::PacketMax]; size_t n=network::encode(f,b,sizeof(b));
     assert(n); received.assign(b,b+n); loop();
 }
 // Let the scheduled acknowledgement go out, complete its transmission, and check it.
 bool flushAck(const chat::Message& expected) {
     sent.clear(); fakeTime+=1100; loop();
-    chat::Ack a;
-    bool ok=!sent.empty() && chat::decodeAck(sent.data(),sent.size(),a) &&
-        chat::acknowledges(a,expected) && a.from==deviceId();
+    network::Frame f;
+    bool ok=!sent.empty() && network::decode(sent.data(),sent.size(),f) && f.ack &&
+        chat::acknowledges(f.receipt,expected) && f.receipt.from==deviceId();
     if(!sent.empty()) { txResult=1; loop(); }
     return ok;
 }
@@ -130,28 +132,26 @@ void appTests() {
     key(Key::Send); fakeTime+=25000; loop(); assert(sending);
     txResult=-1; loop(); assert(view==View::Compose && !strcmp(draft,"Hi"));
     assert(state.count==0); // failed send cannot enter sent history
-    // Transmitted, but nobody acknowledged: back to the editor with the text.
-    key(Key::Send); fakeTime+=25000; loop(); assert(sending);
-    chat::Message first; assert(chat::decode(sent.data(),sent.size(),first));
+    // New text starts a fresh delivery; lost ACK triggers a bounded automatic retry.
+    key(Key::Character,'!'); key(Key::Send); fakeTime+=25000; loop(); assert(sending);
+    network::Frame first; assert(network::decode(sent.data(),sent.size(),first));
+    assert(first.attempt==0);
     txResult=1; loop(); assert(awaiting && !sending);
-    fakeTime+=AckWindowMs+1; loop();
-    assert(!awaiting && view==View::Compose && !strcmp(draft,"Hi") && state.count==0);
-    assert(strstr(lastScreen.lines[0],"Not delivered"));
-    // Resending unchanged text keeps its identity; another device's acknowledgement completes it.
-    key(Key::Send); fakeTime+=25000; loop(); assert(sending);
-    chat::Message outgoing; assert(chat::decode(sent.data(),sent.size(),outgoing));
-    assert(chat::sameId(first,outgoing));
-    assert(outgoing.sender==deviceId() && !strcmp(outgoing.name,"Bob"));
+    fakeTime+=AckWindowMs+1; loop(); assert(queued && attempt==1);
+    fakeTime+=2000; loop(); assert(sending);
+    network::Frame second; assert(network::decode(sent.data(),sent.size(),second));
+    assert(second.attempt==1 && chat::sameId(first.message,second.message));
     txResult=1; loop(); assert(awaiting);
-    deliverAck(outgoing,deviceId()); assert(awaiting); // own acknowledgement ignored
-    deliverAck(message(9)); assert(awaiting);          // acknowledgement of another message
-    deliverAck(outgoing); assert(!awaiting && view==View::Inbox && state.count==1 && !draft[0]);
+    deliverAck(second.message,deviceId()); assert(awaiting);
+    deliverAck(message(9)); assert(awaiting);
+    deliverAck(second.message); assert(!awaiting && view==View::Inbox && state.count==1 && !draft[0]);
     assert(strstr(lastScreen.lines[0],"Delivered"));
     const int chimesBefore=chimes;
     deliver(message()); assert(state.count==2 && chimes==chimesBefore+1);
     assert(flushAck(message()));
     deliver(message()); assert(state.count==2 && chimes==chimesBefore+1); // duplicate ignored...
-    assert(flushAck(message()));                                          // ...but acknowledged again
+    assert(!flushAck(message())); // same attempt cannot generate another ACK
+    deliver(message(),1); assert(flushAck(message())); // new attempt can
     key(Key::Character,'x'); deliver(message(2)); assert(!strcmp(draft,"x") && view==View::Compose);
     assert(flushAck(message(2)));
     key(Key::Back); assert(view==View::Inbox && !strcmp(draft,"x")); // Wio Back leaves the editor, keeping the draft
@@ -168,17 +168,25 @@ void appTests() {
     chat::State recovered; assert(chat::restore(files[goodSlot].data(),files[goodSlot].size(),recovered));
     assert(recovered.count==before.count);
     assert(!chat::restore(files[1-goodSlot].data(),files[1-goodSlot].size(),recovered));
-    assert(flushAck(message(4)));
+    assert(!flushAck(message(4))); // unsaved message cannot be acknowledged
+    deliver(message(4),1); assert(flushAck(message(4)));
     // Queue expiry keeps text available to retry.
-    channelBusy=true; key(Key::Send); fakeTime+=91000; loop();
+    channelBusy=true; key(Key::Send); fakeTime+=network::Lifetime+1; loop();
     assert(!queued && !sending && draft[0]);
     // A channel that always reads busy cannot block sending: after MaxBusyChecks it transmits anyway.
     key(Key::Send);
     for(unsigned i=0;i<=MaxBusyChecks && !sending;++i) { fakeTime+=1600; loop(); }
     assert(sending && busyChecks==MaxBusyChecks);
     channelBusy=false;
-    txResult=1; loop(); fakeTime+=AckWindowMs+1; loop();
-    assert(!awaiting && view==View::Compose && draft[0]);
+    txResult=1; loop();
+    for(unsigned retry=1;retry<network::Attempts;++retry) {
+        fakeTime+=AckWindowMs+1; loop(); assert(queued);
+        fakeTime+=2000; loop(); assert(sending);
+        txResult=1; loop(); assert(awaiting);
+    }
+    fakeTime+=AckWindowMs+1; loop();
+    assert(!awaiting && !queued && view==View::Compose && draft[0]);
+    assert(!strcmp(status,"Delivery unconfirmed"));
     // The display sleeps after 10 s without input; the waking press is not applied.
     fakeTime+=ScreenTimeoutMs+1; loop(); assert(!displayOn && !screenPower);
     const size_t length=strlen(draft);
@@ -188,4 +196,39 @@ void appTests() {
     deliver(message(5)); assert(displayOn && screenPower);
     puts("PASS: onboarding, save failure, send/ack/no-ack/resend, receive acks and chime, paging, editor exit, recovery, display sleep");
 }
-int main() { protocolTests(); appTests(); puts("All tests passed."); }
+void relayTests() {
+    network::Frame f; f.message=message();
+    uint8_t b[network::PacketMax]; size_t n=network::encode(f,b,sizeof(b));
+    network::Frame decoded; assert(n && network::decode(b,n,decoded));
+    for(size_t i=0;i<n;++i) { b[i]^=1; assert(!network::decode(b,n,decoded)); b[i]^=1; }
+    for(size_t i=0;i<n;++i) assert(!network::decode(b,i,decoded));
+    f.attempt=3; assert(!network::encode(f,b,sizeof(b))); f.attempt=0;
+    network::Relay relay, other;
+    assert(relay.accept(f,100,0)); assert(!relay.accept(f,101,0));
+    auto* q=relay.next(1000); assert(q && q->frame.hops==0);
+    assert(chat::sameId(q->frame.message,f.message));
+    assert(!other.accept(q->frame,1000,0)); // two relays cannot ping-pong
+    q->used=false;
+    assert(!relay.accept(f,2000,0));
+    f.attempt=1; assert(relay.accept(f,2000,0));
+    network::Frame ack; ack.ack=true; ack.attempt=1;
+    ack.receipt.sender=f.message.sender; ack.receipt.session=f.message.session;
+    ack.receipt.sequence=f.message.sequence; ack.receipt.from=1234;
+    assert(relay.accept(ack,2000,0));
+    q=relay.next(3000); assert(q && q->frame.ack); // ACK priority
+    assert(q->frame.receipt.from==1234 && q->frame.hops==0);
+    assert(!other.accept(q->frame,3000,0)); q->used=false;
+    assert(!relay.accept(ack,3000,0));
+    assert(!relay.next(2000+network::Lifetime)); // queued traffic expires
+    network::Seen<1> cache;
+    assert(cache.insert(f,0xfffffff0));
+    assert(!cache.insert(f,20));
+    ++f.message.sequence; assert(!cache.insert(f,20)); // no live eviction
+    assert(cache.insert(f,network::Lifetime)); // expiry across clock rollover
+    network::Relay full;
+    for(unsigned i=0;i<4;++i) { f.message.sequence=i+1; assert(full.accept(f,0,0)); }
+    ++f.message.sequence; assert(!full.accept(f,0,0));
+    assert(full.accept(ack,0,0)); // data cannot consume ACK slots
+    puts("PASS: relay hop limit, duplicate caches, retries, ACK priority, queue bounds, expiry and rollover");
+}
+int main() { protocolTests(); relayTests(); appTests(); puts("All tests passed."); }
